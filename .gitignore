@@ -1,0 +1,9 @@
+# binaries
+hfx.exe
+
+# logs
+logs/
+*.log
+
+# local config
+nekotrans.json
