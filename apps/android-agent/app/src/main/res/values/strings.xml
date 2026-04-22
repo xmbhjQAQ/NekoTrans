@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Nekotrans Agent</string>
+    <string name="agent_title">Nekotrans Agent</string>
+    <string name="channel_name">Nekotrans Agent</string>
+    <string name="channel_description">Foreground transfer status for Nekotrans tasks.</string>
+    <string name="service_waiting">Waiting for tasks from the desktop app</string>
+    <string name="service_running">Foreground service started and ready for transfer</string>
+</resources>
+
