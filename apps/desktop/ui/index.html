@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -13,242 +13,184 @@
           <div class="brand-mark">N</div>
           <div>
             <h1>Nekotrans</h1>
-            <p>ADB + Wi-Fi Dual Track</p>
+            <p>ADB + Wi-Fi 双通道</p>
           </div>
         </div>
         <nav>
-          <button class="nav-item active">Dashboard</button>
-          <button class="nav-item">Transfers</button>
-          <button class="nav-item">Devices</button>
-          <button class="nav-item">Logs</button>
-          <button class="nav-item">Settings</button>
+          <button class="nav-item active" data-section="dashboard">总览</button>
+          <button class="nav-item" data-section="transfers">传输</button>
+          <button class="nav-item" data-section="devices">设备</button>
+          <button class="nav-item" data-section="logs">日志</button>
         </nav>
       </aside>
 
       <main class="content">
-        <section class="hero">
+        <section id="dashboard" class="topbar">
           <div>
-            <span class="eyebrow">Windows controller / Android foreground agent</span>
-            <h2>Dual-end transfer console</h2>
-            <p>
-              Pick a linked phone, fill a transfer draft from its live ADB and Wi-Fi probes, then run
-              resumable ADB, Wi-Fi, or Dual Track workers from one console.
-            </p>
+            <span class="eyebrow">Windows 控制端 / Android 前台代理</span>
+            <h2>Nekotrans</h2>
           </div>
           <div class="metrics">
             <div class="metric-card">
-              <span>Linked devices</span>
+              <span>设备</span>
               <strong id="metric-devices">0</strong>
             </div>
             <div class="metric-card">
-              <span>Dual ready</span>
+              <span>双通道可用</span>
               <strong id="metric-dual-ready">0</strong>
             </div>
             <div class="metric-card">
-              <span>Active tasks</span>
+              <span>活跃任务</span>
               <strong id="metric-active-tasks">0</strong>
             </div>
           </div>
         </section>
 
-        <section class="grid">
-          <article class="panel">
+        <section class="workspace">
+          <article id="devices" class="panel device-panel">
             <div class="panel-header">
-              <h3>Device Preflight</h3>
-              <button id="refresh-devices-btn" class="inline-action">Refresh Links</button>
+              <h3>设备</h3>
+              <button id="refresh-devices-btn" class="icon-btn" title="刷新连接" type="button">↻</button>
+            </div>
+            <div class="step-card">
+              <strong>1. 连接手机</strong>
+              <span id="device-step-text">正在检测 ADB 与 Wi-Fi 代理...</span>
             </div>
             <div id="link-overview" class="link-overview"></div>
             <div id="device-list" class="stack"></div>
-            <div class="manual-probe">
-              <input id="agent-host-input" placeholder="Manual agent IP, e.g. 192.168.31.20" />
-              <button id="probe-agent-btn" class="inline-action">Probe Agent</button>
-              <button id="start-agent-task-btn" class="inline-action">Start Agent Task</button>
-              <button id="pause-agent-task-btn" class="inline-action">Pause Agent</button>
-              <button id="resume-agent-task-btn" class="inline-action">Resume Agent</button>
-              <button id="push-agent-sample-btn" class="inline-action">Push Sample Chunk</button>
+            <div class="agent-strip">
+              <input id="agent-host-input" placeholder="192.168.11.102" />
+              <button id="probe-agent-btn" class="secondary-btn" type="button">探测</button>
             </div>
             <pre id="agent-probe-output" class="mini-log"></pre>
           </article>
 
-          <article class="panel">
+          <article class="panel transfer-builder">
             <div class="panel-header">
-              <h3>Task Template</h3>
-              <span class="badge">Demo</span>
+              <h3>新建传输</h3>
+              <span id="selected-device-badge" class="badge">未选择设备</span>
             </div>
-            <div id="task-template" class="stack"></div>
+            <div class="step-card">
+              <strong>2. 选择来源与目标</strong>
+              <span id="draft-step-text">推荐先选择文件或文件夹，然后直接创建并启动。</span>
+            </div>
+
             <form id="draft-form" class="draft-form">
-              <div class="panel-header compact">
-                <h3>Real Task Draft</h3>
-                <span class="badge accent">Local only</span>
+              <div class="segmented" role="group" aria-label="传输方向">
+                <button class="segment active" data-direction="PC -> Android" type="button">PC → Android</button>
+                <button class="segment" data-direction="Android -> PC" type="button">Android → PC</button>
               </div>
-              <label>
-                <span>Source Path</span>
+              <input id="draft-direction" type="hidden" value="PC -> Android" />
+
+              <div class="segmented" role="group" aria-label="传输通道">
+                <button class="segment active" data-mode="Dual Track" type="button">双通道</button>
+                <button class="segment" data-mode="ADB-only" type="button">ADB</button>
+                  <button class="segment" data-mode="Wi-Fi-only" type="button">Wi-Fi</button>
+              </div>
+              <input id="draft-transport-mode" type="hidden" value="Dual Track" />
+
+              <label class="field-block">
+                <span>来源</span>
                 <div class="picker-row">
-                  <input id="draft-source-path" type="text" placeholder="C:\Users\me\Pictures" />
-                  <button id="pick-source-file-btn" class="inline-action" type="button">Pick File</button>
-                  <button id="pick-source-folder-btn" class="inline-action" type="button">Pick Folder</button>
+                  <input id="draft-source-path" type="text" placeholder="选择文件或文件夹" />
+                  <button id="pick-source-file-btn" class="icon-btn" title="选择文件" type="button">📄</button>
+                  <button id="pick-source-folder-btn" class="icon-btn" title="选择文件夹" type="button">📁</button>
                 </div>
               </label>
-              <label>
-                <span>Target Root</span>
+
+              <label class="field-block">
+                <span>目标</span>
                 <div class="picker-row">
-                  <input id="draft-target-root" type="text" placeholder="/sdcard/Nekotrans/Pictures" />
-                  <button id="pick-target-folder-btn" class="inline-action" type="button">Pick Local Folder</button>
+                  <input id="draft-target-root" type="text" placeholder="/sdcard/Nekotrans" />
+                  <button id="pick-target-folder-btn" class="icon-btn" title="选择本地目标文件夹" type="button">📁</button>
                 </div>
-                <small id="draft-target-hint" class="field-hint">
-                  For PC -> Android, enter the Android target path manually. For Android -> PC, you can pick a local folder.
-                </small>
               </label>
-              <label>
-                <span>ADB Serial</span>
-                <input id="draft-device-serial" type="text" placeholder="Use a device id from preflight" />
-              </label>
-              <label>
-                <span>Agent Host</span>
-                <input id="draft-agent-host" type="text" placeholder="Use Android agent LAN IP for Wi-Fi or Dual Track" />
-              </label>
+
               <div class="form-grid">
-                <label>
-                  <span>Direction</span>
-                  <select id="draft-direction">
-                    <option>PC -> Android</option>
-                    <option>Android -> PC</option>
-                  </select>
+                <label class="field-block">
+                  <span>ADB 序列号</span>
+                  <input id="draft-device-serial" type="text" />
                 </label>
-                <label>
-                  <span>Transport Mode</span>
-                  <select id="draft-transport-mode">
-                    <option>Dual Track</option>
-                    <option>ADB-only</option>
-                    <option>Wi-Fi-only</option>
-                  </select>
+                <label class="field-block">
+                  <span>代理地址</span>
+                  <input id="draft-agent-host" type="text" />
                 </label>
               </div>
+
               <div class="form-grid">
-                <label>
-                  <span>Chunk MB</span>
+                <label class="field-block">
+                  <span>分块 MB</span>
                   <input id="draft-chunk-mb" type="number" min="1" value="8" />
                 </label>
-                <label>
-                  <span>Lane Concurrency</span>
+                <label class="field-block">
+                  <span>并发通道</span>
                   <input id="draft-lane-limit" type="number" min="1" value="4" />
                 </label>
               </div>
+
               <label class="check-line">
-                <input id="draft-verify" type="checkbox" />
-                <span>Verify after transfer</span>
+                <input id="draft-verify" type="checkbox" checked />
+                <span>BLAKE3 校验</span>
               </label>
-              <button class="action-btn draft-submit" type="submit">Create Task</button>
-              <small id="draft-lane-hint" class="field-hint">
-                ADB-only requires a serial. Wi-Fi-only requires an agent host. Dual Track currently uses whichever lanes are available.
-              </small>
-              <pre id="draft-summary" class="mini-log draft-summary"></pre>
+
+              <div id="draft-errors" class="error-box"></div>
+              <div class="primary-actions">
+                <button class="primary-btn" data-intent="start" type="submit">创建并启动</button>
+                <button class="secondary-btn" data-intent="create" type="submit">仅创建</button>
+              </div>
             </form>
+          </article>
+
+          <article id="transfers" class="panel queue-panel">
+            <div class="panel-header">
+              <h3>传输</h3>
+              <span id="refresh-state" class="badge">实时</span>
+            </div>
+            <div class="step-card">
+              <strong>3. 查看进度</strong>
+              <span>任务会自动刷新，失败原因会直接显示在卡片内。</span>
+            </div>
+            <div id="task-list" class="stack"></div>
+            <div id="adb-transfer-list" class="stack worker-list"></div>
           </article>
         </section>
 
-        <section class="panel">
-          <div class="panel-header">
-            <h3>Transfer Console</h3>
-            <div class="action-row">
-              <button id="create-local-btn" class="action-btn">Stage docs task</button>
-              <button id="advance-btn" class="action-btn">Advance 3 chunks</button>
-              <button id="pause-btn" class="action-btn muted">Pause</button>
-              <button id="resume-btn" class="action-btn muted">Resume</button>
-            </div>
-          </div>
-          <div id="task-list" class="stack"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-header">
-            <h3>ADB Worker Progress</h3>
-            <span class="badge accent">Chunk worker</span>
-          </div>
-          <div id="adb-transfer-list" class="stack"></div>
-        </section>
-
-        <section class="grid">
+        <section class="workspace lower">
           <article class="panel">
             <div class="panel-header">
-              <h3>Recoverable Tasks</h3>
-              <span class="badge accent">Checkpoint</span>
+              <h3>恢复</h3>
+              <button id="refresh-recover-btn" class="icon-btn" title="刷新" type="button">↻</button>
             </div>
             <div id="recoverable-list" class="stack"></div>
           </article>
 
-          <article class="panel">
+          <article id="logs" class="panel logs-panel">
             <div class="panel-header">
-              <h3>Pipeline Notes</h3>
-              <span class="badge">v1</span>
-            </div>
-            <div class="timeline">
-              <div class="timeline-item">
-                <strong>Inventory first</strong>
-                <p>Local folders expand into file manifests before the chunk scheduler assigns lane work.</p>
-              </div>
-              <div class="timeline-item">
-                <strong>Checkpoint every chunk</strong>
-                <p>Completed chunks are persisted so interrupted tasks can resume without retransmitting finished data.</p>
-              </div>
-              <div class="timeline-item">
-                <strong>Agent handoff</strong>
-                <p>The Android agent keeps long-running transfer execution in a foreground service.</p>
-              </div>
-            </div>
-          </article>
-        </section>
-
-        <section class="grid two-thirds">
-          <article class="panel">
-            <div class="panel-header">
-              <h3>Structured Logs</h3>
+              <h3>日志</h3>
               <div class="action-row">
-                <button id="refresh-logs-btn" class="inline-action">Refresh</button>
-                <button id="export-logs-btn" class="inline-action">Export</button>
+                <button id="fetch-agent-logs-btn" class="secondary-btn" type="button">拉取手机日志</button>
+                <button id="export-logs-btn" class="secondary-btn" type="button">导出</button>
               </div>
             </div>
-            <div class="manual-probe">
-              <input id="log-task-filter" placeholder="Task ID" />
-              <input id="log-device-filter" placeholder="Device host" />
+            <div class="log-filters">
+              <input id="log-task-filter" placeholder="任务 ID" />
+              <input id="log-device-filter" placeholder="设备地址" />
               <select id="log-level-filter">
-                <option value="">Any level</option>
+                <option value="">全部</option>
                 <option value="debug">Debug</option>
                 <option value="info">Info</option>
                 <option value="warn">Warn</option>
                 <option value="error">Error</option>
               </select>
-              <input id="log-from-filter" type="datetime-local" title="From time" />
-              <input id="log-to-filter" type="datetime-local" title="To time" />
-              <input id="log-text-filter" placeholder="Contains text" />
-              <button id="fetch-agent-logs-btn" class="inline-action">Fetch Agent Logs</button>
+              <input id="log-text-filter" placeholder="包含文本" />
+              <button id="refresh-logs-btn" class="icon-btn" title="刷新日志" type="button">↻</button>
             </div>
             <pre id="log-export-output" class="mini-log"></pre>
             <pre id="log-output" class="log-view"></pre>
           </article>
-
-          <article class="panel">
-            <div class="panel-header">
-              <h3>Transfer Modes</h3>
-              <span class="badge accent">User selectable</span>
-            </div>
-            <div id="mode-list" class="chip-list"></div>
-            <div class="timeline">
-              <div class="timeline-item">
-                <strong>1. Preflight device</strong>
-                <p>Probe ADB, Android version, agent package, /sdcard access, and Wi-Fi candidate status.</p>
-              </div>
-              <div class="timeline-item">
-                <strong>2. Install agent</strong>
-                <p>Build the Android debug APK, then install it from the desktop device card.</p>
-              </div>
-              <div class="timeline-item">
-                <strong>3. Resume safely</strong>
-                <p>Resume from checkpointed chunk state before starting the real data lanes.</p>
-              </div>
-            </div>
-          </article>
         </section>
+
+        <div id="toast" class="toast" hidden></div>
       </main>
     </div>
 

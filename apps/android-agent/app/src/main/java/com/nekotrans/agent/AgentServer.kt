@@ -20,6 +20,7 @@ import kotlin.concurrent.thread
 private const val MAX_IN_MEMORY_LOGS: Int = 512
 private const val MAX_LOG_FILE_BYTES: Long = 1_048_576
 private const val MAX_LOG_ARCHIVES: Int = 3
+private const val VERIFY_BUFFER_BYTES: Int = 1024 * 1024
 
 object AgentServer {
     const val PORT: Int = 38997
@@ -100,9 +101,9 @@ object AgentServer {
 
     fun statusText(): String {
         return if (isRunning()) {
-            "Capability listener on port $PORT"
+            "监听端口 $PORT"
         } else {
-            "Stopped"
+            "已停止"
         }
     }
 
@@ -113,7 +114,7 @@ object AgentServer {
                 AgentTaskSummary(
                     taskId = "None",
                     state = "Idle",
-                    message = "Waiting for desktop task",
+                    message = "等待桌面端任务",
                     files = "0 / 0",
                     chunks = "0",
                     bytes = "0 B",
@@ -779,19 +780,36 @@ object AgentServer {
             return ERROR_JSON
         }
 
-        return synchronized(taskLock) {
-            activeTask ?: return@synchronized ERROR_JSON
-            val target = readableFileFor(relativePath) ?: return@synchronized ERROR_JSON
-            if (!target.exists()) {
-                return@synchronized "{\"type\":\"Error\",\"message\":\"file not found\"}"
+        val taskId: String
+        val target: File
+        synchronized(taskLock) {
+            val task = activeTask ?: return ERROR_JSON
+            val readable = readableFileFor(relativePath) ?: return ERROR_JSON
+            if (!readable.exists()) {
+                return "{\"type\":\"Error\",\"message\":\"file not found\"}"
             }
             if (!algorithm.equals("BLAKE3", ignoreCase = true)) {
-                return@synchronized "{\"type\":\"Error\",\"message\":\"unsupported verify algorithm: ${escapeJson(algorithm)}\"}"
+                return "{\"type\":\"Error\",\"message\":\"unsupported verify algorithm: ${escapeJson(algorithm)}\"}"
             }
-            val digest = blake3Digest(target)
-            appendLog("transfer", activeTask?.taskId ?: "", "verify requested: $relativePath")
-            "{\"type\":\"VerifyResult\",\"relative_path\":\"${escapeJson(relativePath)}\",\"algorithm\":\"BLAKE3\",\"digest\":\"$digest\"}"
+            taskId = task.taskId
+            target = readable
+            activeTask = task.copy(
+                message = "verifying target file",
+                lastRelativePath = relativePath,
+                updatedAtEpochMs = nowEpochMs(),
+            )
         }
+
+        val digest = blake3Digest(target)
+        synchronized(taskLock) {
+            activeTask = activeTask?.copy(
+                message = "verify completed",
+                lastRelativePath = relativePath,
+                updatedAtEpochMs = nowEpochMs(),
+            )
+            appendLog("transfer", taskId, "verify requested: $relativePath")
+        }
+        return "{\"type\":\"VerifyResult\",\"relative_path\":\"${escapeJson(relativePath)}\",\"algorithm\":\"BLAKE3\",\"digest\":\"$digest\"}"
     }
 
     private fun currentFileSnapshotJson(): String {
@@ -1097,7 +1115,20 @@ private fun formatBytes(value: Long): String {
 
 private fun blake3Digest(file: File): String {
     val hasher = Blake3.newInstance()
-    hasher.update(file)
+    val buffer = ByteArray(VERIFY_BUFFER_BYTES)
+    file.inputStream().use { input ->
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) {
+                break
+            }
+            if (read == buffer.size) {
+                hasher.update(buffer)
+            } else if (read > 0) {
+                hasher.update(buffer.copyOf(read))
+            }
+        }
+    }
     return hasher.hexdigest()
 }
 

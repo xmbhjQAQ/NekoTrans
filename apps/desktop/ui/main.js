@@ -1,889 +1,750 @@
 const invoke = window.__TAURI__?.core?.invoke;
 
+const state = {
+  selectedDeviceId: null,
+  selectedAgentHost: null,
+  refreshTimer: null,
+  busy: false,
+};
+
 async function loadDashboard() {
-  const dashboard = invoke
-    ? await invoke("bootstrap_dashboard")
-    : {
-        app_name: "Nekotrans",
-        transport_modes: ["ADB-only", "Wi-Fi-only", "Dual Track"],
-        devices: [
-          {
-            id: "R3CN30ABCDEF",
-            label: "Pixel 7 Pro",
-            lane_mode: "ADB (USB) + TCP Candidate",
-            agent_host: "192.168.31.20",
-            adb_ready: true,
-            wifi_ready: true,
-            transfer_ready: true,
-            protocol_version: "adb-preflight",
-            status_text: "adb shell ready",
-            platform_text: "Google / Android 14 / SDK 34",
-            preflight_checks: [
-              { label: "ADB Link", passed: true, detail: "status=device" },
-              { label: "Shell Ready", passed: true, detail: "device" },
-              { label: "Android SDK", passed: true, detail: "Android 14 / SDK 34" },
-              { label: "CPU ABI", passed: true, detail: "arm64-v8a" },
-              { label: "Wi-Fi Candidate", passed: true, detail: "5555" },
-              { label: "Agent Package", passed: false, detail: "not installed" },
-              { label: "Remote /sdcard", passed: true, detail: "reachable" },
-              { label: "Probe Error", passed: true, detail: "none" },
-            ],
-          },
-        ],
-        tasks: [
-          {
-            task_id: "demo-task",
-            state: "Pending",
-            direction: "PC -> Android",
-            transport_mode: "Dual Track",
-            verify_enabled: false,
-            total_files: 3,
-            total_bytes: 114294784,
-            committed_bytes: 0,
-            progress_percent: 0,
-            adb_bytes: 0,
-            wifi_bytes: 0,
-            completed_chunks: 0,
-          },
-        ],
-        recoverable_tasks: ["demo-task"],
-        sample_logs: [
-          "{\"scope\":\"audit\",\"message\":\"desktop shell started\"}",
-          "{\"scope\":\"device\",\"message\":\"adb discovery completed\"}",
-        ],
-      };
-
-  const template = invoke
-    ? await invoke("sample_task_template")
-    : {
-        task_id: "demo-task",
-        direction: "PC -> Android",
-        transport_mode: "Dual Track",
-        verify_enabled: false,
-        chunk_size_mb: 8,
-      };
-
-  renderDevices(dashboard.devices);
-  renderConnectionOverview(dashboard);
-  renderModes(dashboard.transport_modes);
-  renderDraftTransportModes(dashboard.transport_modes);
-  renderTemplate(template);
-  renderTasks(dashboard.tasks);
-  renderRecoverables(dashboard.recoverable_tasks);
-  renderAdbTransfers(invoke ? await invoke("list_adb_transfers") : []);
-  document.querySelector("#log-output").textContent = dashboard.sample_logs.join("\n");
-  bindActions();
+  bindStaticActions();
+  if (!invoke) {
+    ensureInvokeReady({ log: true });
+  }
+  await refreshDashboard({ includeLogs: true, silent: false });
+  state.refreshTimer = setInterval(() => refreshDashboard({ includeLogs: false, silent: true }), 2500);
 }
 
-function renderDevices(devices) {
-  const host = document.querySelector("#device-list");
-  host.innerHTML = "";
-  if (!devices.length) {
-    host.innerHTML = `<div class="empty-state">No attached ADB devices were discovered.</div>`;
+async function fetchDashboard() {
+  if (invoke) {
+    const [dashboard, adbTransfers] = await Promise.all([
+      invoke("bootstrap_dashboard"),
+      invoke("list_adb_transfers"),
+    ]);
+    return { dashboard, adbTransfers };
+  }
+
+  return {
+    dashboard: {
+      app_name: "Nekotrans",
+      transport_modes: ["ADB-only", "Wi-Fi-only", "Dual Track"],
+      devices: [],
+      tasks: [],
+      recoverable_tasks: [],
+      sample_logs: [],
+    },
+    adbTransfers: [],
+  };
+}
+
+async function refreshDashboard({ includeLogs = false, silent = true } = {}) {
+  if (state.busy && silent) {
     return;
   }
 
-  for (const device of devices) {
-    const card = document.createElement("div");
-    card.className = "device-card";
-    const installDisabled = !device.adb_ready ? "disabled" : "";
-    const agentHost = device.agent_host || "";
-    const wifiDisabled = agentHost && device.wifi_ready ? "" : "disabled";
-    const dualDisabled = device.adb_ready && agentHost ? "" : "disabled";
-    card.innerHTML = `
-      <div class="device-body">
-        <div>
-          <strong>${escapeHtml(device.label)}</strong>
-          <p>${escapeHtml(device.id)} / ${escapeHtml(device.lane_mode)} / ${escapeHtml(device.platform_text)}</p>
-          <p>${escapeHtml(device.status_text)}</p>
-        </div>
-        <div class="status-grid">
-          <span class="${device.adb_ready ? "good" : "bad"}">ADB</span>
-          <span class="${device.wifi_ready ? "good" : "warn"}">Wi-Fi Candidate</span>
-          <span class="${device.transfer_ready ? "good" : "warn"}">Transfer Ready</span>
-          <button class="inline-action" data-install="${device.id}" ${installDisabled}>Install Agent</button>
-          <button class="inline-action" data-push-docs="${device.id}" ${installDisabled}>Push Docs</button>
-        </div>
-      </div>
-      <div class="lane-pair">
-        <div>
-          <span>Desktop fills</span>
-          <strong>${escapeHtml(device.id)}</strong>
-        </div>
-        <div>
-          <span>Android agent</span>
-          <strong>${agentHost ? escapeHtml(`${agentHost}:38997`) : "Not discovered"}</strong>
-        </div>
-      </div>
-      <div class="action-row">
-        <button class="inline-action" data-use-device="${device.id}" data-agent-host="${escapeHtml(agentHost)}" data-use-mode="Dual Track" ${dualDisabled}>Use Dual</button>
-        <button class="inline-action" data-use-device="${device.id}" data-agent-host="${escapeHtml(agentHost)}" data-use-mode="ADB-only" ${installDisabled}>Use ADB</button>
-        <button class="inline-action" data-use-device="${device.id}" data-agent-host="${escapeHtml(agentHost)}" data-use-mode="Wi-Fi-only" ${wifiDisabled}>Use Wi-Fi</button>
-      </div>
-      <div class="check-grid">
-        ${device.preflight_checks
-          .map(
-            (check) => `
-              <div class="check-card">
-                <span class="${check.passed ? "good" : "warn"}">${escapeHtml(check.label)}</span>
-                <strong>${escapeHtml(check.detail)}</strong>
-              </div>
-            `,
-          )
-          .join("")}
-      </div>
-    `;
-    host.appendChild(card);
+  try {
+    const { dashboard, adbTransfers } = await fetchDashboard();
+    const allTasks = dashboard.tasks || [];
+    const visibleTasks = visibleTaskCards(allTasks);
+    autoSelectDevice(dashboard.devices || []);
+    renderConnectionOverview(dashboard);
+    renderDevices(dashboard.devices || []);
+    renderTasks(visibleTasks, adbTransfers || []);
+    renderRecoverables(dashboard.recoverable_tasks || [], allTasks);
+    renderAdbTransfers(adbTransfers || [], allTasks);
+    if (includeLogs) {
+      await refreshLogs();
+    }
+    setRefreshState("实时");
+  } catch (error) {
+    setRefreshState("离线");
+    showToast(String(error), true);
   }
+}
 
-  for (const button of host.querySelectorAll("[data-install]")) {
-    button.addEventListener("click", async (event) => {
-      const serial = event.currentTarget.getAttribute("data-install");
-      await installAgent(serial);
+function visibleTaskCards(tasks) {
+  return tasks
+    .filter((task) => task.task_id !== "demo-task")
+    .sort((left, right) => {
+      const rank = { Running: 0, Failed: 1, Paused: 2, Pending: 3, Completed: 4, Cancelled: 5 };
+      return (rank[left.state] ?? 10) - (rank[right.state] ?? 10);
+    });
+}
+
+function autoSelectDevice(devices) {
+  if (state.selectedDeviceId || !devices.length) {
+    updateDeviceStep(devices);
+    return;
+  }
+  const best = devices.find((device) => device.adb_ready && device.agent_host) ||
+    devices.find((device) => device.adb_ready) ||
+    devices[0];
+  if (best) {
+    fillDraftFromDevice(best.id, best.agent_host || "", best.adb_ready && best.agent_host ? "Dual Track" : best.adb_ready ? "ADB-only" : "Wi-Fi-only", {
+      silent: true,
     });
   }
+  updateDeviceStep(devices);
+}
 
-  for (const button of host.querySelectorAll("[data-push-docs]")) {
-    button.addEventListener("click", async (event) => {
-      const serial = event.currentTarget.getAttribute("data-push-docs");
-      await pushDocs(serial);
-    });
-  }
-
-  for (const button of host.querySelectorAll("[data-use-device]")) {
-    button.addEventListener("click", (event) => {
-      const target = event.currentTarget;
-      fillDraftFromDevice(
-        target.getAttribute("data-use-device"),
-        target.getAttribute("data-agent-host"),
-        target.getAttribute("data-use-mode"),
-      );
-    });
-  }
+function updateDeviceStep(devices) {
+  const ready = devices.find((device) => device.adb_ready && device.agent_host);
+  const adbOnly = devices.find((device) => device.adb_ready);
+  const message = ready
+    ? `已选择 ${ready.label}，双通道可用：${ready.id} + ${ready.agent_host}:38997`
+    : adbOnly
+      ? `已检测到 ${adbOnly.label}，ADB 可用；等待手机端 Wi-Fi 代理地址。`
+      : "请连接手机并允许 USB 调试。";
+  text("#device-step-text", message);
 }
 
 function renderConnectionOverview(dashboard) {
   const devices = dashboard.devices || [];
-  const tasks = dashboard.tasks || [];
+  const tasks = (dashboard.tasks || []).filter((task) => task.task_id !== "demo-task");
   const dualReady = devices.filter((device) => device.adb_ready && device.agent_host).length;
   const activeTasks = tasks.filter((task) => ["Pending", "Running", "Paused", "Failed"].includes(task.state)).length;
-  document.querySelector("#metric-devices").textContent = String(devices.length);
-  document.querySelector("#metric-dual-ready").textContent = String(dualReady);
-  document.querySelector("#metric-active-tasks").textContent = String(activeTasks);
+
+  text("#metric-devices", devices.length);
+  text("#metric-dual-ready", dualReady);
+  text("#metric-active-tasks", activeTasks);
 
   const overview = document.querySelector("#link-overview");
-  if (!overview) {
+  const best = devices.find((device) => device.id === state.selectedDeviceId) ||
+    devices.find((device) => device.adb_ready && device.agent_host) ||
+    devices[0];
+
+  if (!best) {
+    overview.innerHTML = `<div class="empty-state">没有已连接的 Android 设备。</div>`;
     return;
   }
-  const bestDevice = devices.find((device) => device.adb_ready && device.agent_host) || devices[0];
-  if (!bestDevice) {
-    overview.innerHTML = `<div class="empty-state">Connect an Android phone with USB debugging enabled, then refresh links.</div>`;
-    return;
-  }
+
   overview.innerHTML = `
-    <div class="link-node">
+    <div class="endpoint-node">
       <span>Windows</span>
-      <strong>Desktop scheduler</strong>
+      <strong>调度器</strong>
     </div>
-    <div class="link-arrow">ADB + Wi-Fi</div>
-    <div class="link-node">
+    <div class="route-lines">
+      <span class="${best.adb_ready ? "good" : "warn"}">ADB</span>
+      <span class="${best.agent_host ? "good" : "warn"}">Wi-Fi</span>
+    </div>
+    <div class="endpoint-node">
       <span>Android</span>
-      <strong>${escapeHtml(bestDevice.label)}</strong>
-      <small>${escapeHtml(bestDevice.agent_host ? `${bestDevice.agent_host}:38997` : bestDevice.id)}</small>
+      <strong>${escapeHtml(best.label)}</strong>
+      <small>${escapeHtml(best.agent_host ? `${best.agent_host}:38997` : best.id)}</small>
     </div>
   `;
 }
 
-function fillDraftFromDevice(serial, agentHost, mode) {
-  const serialInput = document.querySelector("#draft-device-serial");
-  const agentInput = document.querySelector("#draft-agent-host");
-  const manualAgentInput = document.querySelector("#agent-host-input");
-  const modeSelect = document.querySelector("#draft-transport-mode");
-  const directionSelect = document.querySelector("#draft-direction");
-  const targetInput = document.querySelector("#draft-target-root");
-  const verifyInput = document.querySelector("#draft-verify");
-  const output = document.querySelector("#draft-summary");
+function renderDevices(devices) {
+  const host = document.querySelector("#device-list");
+  if (!devices.length) {
+    host.innerHTML = `<div class="empty-state">请连接已开启 USB 调试的手机。</div>`;
+    return;
+  }
 
-  if (serialInput) {
-    serialInput.value = serial || "";
+  host.innerHTML = devices.map((device) => {
+    const selected = device.id === state.selectedDeviceId ? " selected" : "";
+    const agentHost = device.agent_host || "";
+    return `
+      <div class="device-card${selected}" data-device-card="${escapeHtml(device.id)}">
+        <div class="device-main">
+          <div>
+            <strong>${escapeHtml(device.label)}</strong>
+            <p>${escapeHtml(device.id)}</p>
+          </div>
+          <div class="badge-row">
+            <span class="badge ${device.adb_ready ? "good" : "warn"}">ADB</span>
+          <span class="badge ${agentHost ? "good" : "warn"}">Wi-Fi</span>
+          </div>
+        </div>
+        <div class="device-paths">
+          <span>${escapeHtml(device.platform_text)}</span>
+          <strong>${escapeHtml(agentHost ? `${agentHost}:38997` : "未发现代理地址")}</strong>
+        </div>
+        <div class="action-row">
+          <button class="secondary-btn" data-use-mode="Dual Track" data-device="${escapeHtml(device.id)}" data-host="${escapeHtml(agentHost)}" ${device.adb_ready && agentHost ? "" : "disabled"}>双通道</button>
+          <button class="secondary-btn" data-use-mode="ADB-only" data-device="${escapeHtml(device.id)}" data-host="${escapeHtml(agentHost)}" ${device.adb_ready ? "" : "disabled"}>ADB</button>
+          <button class="secondary-btn" data-use-mode="Wi-Fi-only" data-device="${escapeHtml(device.id)}" data-host="${escapeHtml(agentHost)}" ${agentHost ? "" : "disabled"}>Wi-Fi</button>
+          <button class="icon-btn" title="安装手机端代理" data-install="${escapeHtml(device.id)}" ${device.adb_ready ? "" : "disabled"}>↓</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  for (const button of host.querySelectorAll("[data-use-mode]")) {
+    button.addEventListener("click", (event) => {
+      const target = event.currentTarget;
+      fillDraftFromDevice(target.dataset.device, target.dataset.host, target.dataset.useMode);
+    });
   }
-  if (agentInput) {
-    agentInput.value = agentHost || "";
+
+  for (const button of host.querySelectorAll("[data-install]")) {
+    button.addEventListener("click", async (event) => {
+      await withBusy(async () => {
+        const serial = event.currentTarget.dataset.install;
+        await invoke("install_agent", { serial });
+        showToast("手机端代理已安装。");
+      });
+      await refreshDashboard({ includeLogs: false, silent: false });
+    });
   }
-  if (manualAgentInput && agentHost) {
-    manualAgentInput.value = agentHost;
+}
+
+function fillDraftFromDevice(serial, agentHost, mode, options = {}) {
+  state.selectedDeviceId = serial || null;
+  state.selectedAgentHost = agentHost || null;
+  setValue("#draft-device-serial", serial || "");
+  setValue("#draft-agent-host", agentHost || "");
+  setValue("#agent-host-input", agentHost || "");
+  setValue("#draft-transport-mode", mode || "Dual Track");
+  setSegment(".segment[data-mode]", mode || "Dual Track", "mode");
+  setValue("#draft-direction", "PC -> Android");
+  setSegment(".segment[data-direction]", "PC -> Android", "direction");
+  if (!value("#draft-target-root")) {
+    setValue("#draft-target-root", "/sdcard/Nekotrans");
   }
-  if (modeSelect && mode) {
-    modeSelect.value = mode;
-  }
-  if (directionSelect) {
-    directionSelect.value = "PC -> Android";
-  }
-  if (targetInput && !targetInput.value.trim()) {
-    targetInput.value = "/sdcard/Nekotrans";
-  }
-  if (verifyInput) {
-    verifyInput.checked = true;
-  }
+  document.querySelector("#draft-verify").checked = true;
+  text("#selected-device-badge", serial ? `${serial}${agentHost ? ` / ${agentHost}` : ""}` : "未选择设备");
   syncDraftDirectionUi();
-  if (output) {
-    output.textContent = JSON.stringify(
-      { selected_device: serial, agent_host: agentHost || null, transport_mode: mode },
-      null,
-      2,
-    );
+  if (!options.silent) {
+    showToast(mode === "Dual Track" ? "已选择双通道设备。" : "已选择设备。");
   }
 }
 
-async function installAgent(serial) {
-  if (!invoke) {
+function renderTasks(tasks, transfers = []) {
+  const host = document.querySelector("#task-list");
+  if (!tasks.length) {
+    host.innerHTML = `<div class="empty-state">暂无传输任务。选择来源后点击“创建并启动”。</div>`;
     return;
   }
+  const transferByTask = new Map(transfers.map((transfer) => [transfer.task_id, transfer]));
 
-  try {
-    const result = await invoke("install_agent", { serial });
-    console.log(result);
-  } catch (error) {
-    console.error(error);
-  }
+  host.innerHTML = tasks.map((task) => {
+    const transfer = transferByTask.get(task.task_id);
+    const canStart = task.state === "Pending";
+    const canPause = task.state === "Running";
+    const canResume = task.state === "Paused";
+    const canRetry = task.state === "Failed";
+    const canCancel = !["Completed", "Cancelled"].includes(task.state);
+    const stateClass = task.state === "Completed" ? "good" : task.state === "Failed" ? "bad" : task.state === "Paused" ? "accent" : "";
+    return `
+      <div class="task-card">
+        <div class="task-header">
+          <div>
+            <strong>${escapeHtml(task.task_id)}</strong>
+          <p>${escapeHtml(displayDirection(task.direction))} / ${escapeHtml(displayMode(task.transport_mode))}</p>
+          </div>
+          <span class="badge ${stateClass}">${escapeHtml(displayState(task.state))}</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" style="width:${task.progress_percent}%"></div></div>
+        <div class="task-stats">
+          <span>${task.progress_percent}%</span>
+          <span>${formatBytes(task.committed_bytes)} / ${formatBytes(task.total_bytes)}</span>
+          <span>ADB ${formatBytes(task.adb_bytes)}</span>
+          <span>Wi-Fi ${formatBytes(task.wifi_bytes)}</span>
+        </div>
+        ${transfer ? `<p class="stage-line">${escapeHtml(displayWorkerStage(transfer.last_event, transfer.last_message, task))}</p>` : ""}
+        ${task.last_error ? `<p class="error-line">${escapeHtml(task.last_error)}</p>` : ""}
+        <div class="action-row">
+          <button class="secondary-btn" data-start-task="${escapeHtml(task.task_id)}" ${canStart ? "" : "disabled"}>启动</button>
+          <button class="secondary-btn" data-pause-task="${escapeHtml(task.task_id)}" ${canPause ? "" : "disabled"}>暂停</button>
+          <button class="secondary-btn" data-resume-task="${escapeHtml(task.task_id)}" ${task.state === "Paused" ? "" : "disabled"}>继续</button>
+          <button class="secondary-btn" data-retry-task="${escapeHtml(task.task_id)}" ${canRetry ? "" : "disabled"}>重试</button>
+          <button class="secondary-btn" data-delete-task="${escapeHtml(task.task_id)}" ${task.state === "Running" ? "disabled" : ""}>删除记录</button>
+          <button class="danger-btn" data-cancel-task="${escapeHtml(task.task_id)}" ${canCancel ? "" : "disabled"}>取消</button>
+        </div>
+      </div>
+    `;
+  }).join("");
 
-  await refreshDashboard();
+  bindTaskButtons(host);
 }
 
-async function pushDocs(serial) {
-  if (!invoke) {
-    return;
-  }
-
-  try {
-    const result = await invoke("start_adb_docs_push", { serial });
-    console.log(result);
-  } catch (error) {
-    console.error(error);
-  }
-
-  await refreshDashboard();
-}
-
-async function pauseAdbTransfer(taskId) {
-  if (!invoke) {
-    return;
-  }
-
-  try {
-    await invoke("pause_adb_transfer", { taskId });
-  } catch (error) {
-    console.error(error);
-  }
-
-  await refreshDashboard();
-}
-
-async function probeAgentHost() {
-  if (!invoke) {
-    return;
-  }
-
-  const input = document.querySelector("#agent-host-input");
-  const output = document.querySelector("#agent-probe-output");
-  const host = input?.value?.trim();
-  if (!host) {
-    output.textContent = "Enter a LAN IP first.";
-    return;
-  }
-
-  output.textContent = "Probing...";
-  try {
-    const result = await invoke("probe_wifi_agent", { host });
-    output.textContent = JSON.stringify(result, null, 2);
-  } catch (error) {
-    output.textContent = String(error);
-  }
-}
-
-async function startAgentTask() {
-  if (!invoke) {
-    return;
-  }
-
-  const input = document.querySelector("#agent-host-input");
-  const output = document.querySelector("#agent-probe-output");
-  const host = input?.value?.trim();
-  if (!host) {
-    output.textContent = "Enter a LAN IP first.";
-    return;
-  }
-
-  const taskId = `wifi-skeleton-${Date.now()}`;
-  output.textContent = "Starting agent task skeleton...";
-  try {
-    const result = await invoke("start_wifi_agent_task", { host, taskId });
-    output.textContent = JSON.stringify(result, null, 2);
-  } catch (error) {
-    output.textContent = String(error);
-  }
-}
-
-async function mutateAgentTask(command) {
-  if (!invoke) {
-    return;
-  }
-
-  const input = document.querySelector("#agent-host-input");
-  const output = document.querySelector("#agent-probe-output");
-  const host = input?.value?.trim();
-  if (!host) {
-    output.textContent = "Enter a LAN IP first.";
-    return;
-  }
-
-  output.textContent = "Sending command...";
-  try {
-    const result = await invoke(command, { host });
-    output.textContent = JSON.stringify(result, null, 2);
-  } catch (error) {
-    output.textContent = String(error);
-  }
-}
-
-async function pushAgentSampleChunk() {
-  if (!invoke) {
-    return;
-  }
-
-  const input = document.querySelector("#agent-host-input");
-  const output = document.querySelector("#agent-probe-output");
-  const host = input?.value?.trim();
-  if (!host) {
-    output.textContent = "Enter a LAN IP first.";
-    return;
-  }
-
-  output.textContent = "Pushing sample chunk...";
-  try {
-    const result = await invoke("push_wifi_agent_sample_chunk", { host });
-    output.textContent = JSON.stringify(result, null, 2);
-  } catch (error) {
-    output.textContent = String(error);
-  }
-}
-
-async function resumeAdbTransfer(taskId) {
-  if (!invoke) {
-    return;
-  }
-
-  try {
-    await invoke("resume_adb_transfer", { taskId });
-  } catch (error) {
-    console.error(error);
-  }
-
-  await refreshDashboard();
-}
-
-function renderAdbTransfers(transfers) {
+function renderAdbTransfers(transfers, tasks = []) {
   const host = document.querySelector("#adb-transfer-list");
-  if (!host) {
+  const taskIds = new Set(tasks.map((task) => task.task_id));
+  const visibleTransfers = transfers.filter((transfer) => !taskIds.has(transfer.task_id));
+  if (!visibleTransfers.length) {
+    host.innerHTML = "";
     return;
   }
 
-  host.innerHTML = "";
-  if (!transfers.length) {
-    host.innerHTML = `<div class="empty-state">No ADB worker transfers yet. Use Push Docs on a ready device.</div>`;
-    return;
-  }
-
-  for (const transfer of transfers) {
+  host.innerHTML = visibleTransfers.map((transfer) => {
     const totalFiles = transfer.total_files || 1;
     const completedFiles = transfer.pushed_files + transfer.skipped_files;
     const progress = Math.min(100, Math.round((completedFiles * 100) / totalFiles));
-    const canPause = transfer.state === "Running";
-    const canResume = transfer.state === "Paused";
-    const card = document.createElement("div");
-    card.className = "task-card";
-    card.innerHTML = `
-      <div class="task-header">
-        <div>
-          <strong>${transfer.task_id}</strong>
-          <p>${transfer.serial} / ${transfer.relative_path || "preparing"} / ${transfer.remote_path}</p>
+    return `
+      <div class="worker-card">
+        <div class="task-header">
+          <div>
+            <strong>${escapeHtml(transfer.task_id)}</strong>
+            <p>${escapeHtml(transfer.serial)} / ${escapeHtml(transfer.relative_path || "preparing")}</p>
+          </div>
+          <span class="badge">${escapeHtml(transfer.last_event || transfer.state)}</span>
         </div>
-        <span class="badge ${transfer.state === "Completed" ? "good" : transfer.state === "Paused" ? "accent" : transfer.state === "Failed" ? "bad" : ""}">${transfer.state}</span>
-      </div>
-      <div class="progress-bar">
-        <div class="progress-fill" style="width:${progress}%"></div>
-      </div>
-      <div class="task-stats">
-        <span>Files ${completedFiles}/${transfer.total_files}</span>
-        <span>Chunks +${transfer.pushed_chunks} / skip ${transfer.skipped_chunks}</span>
-        <span>Pushed ${formatBytes(transfer.bytes_pushed)}</span>
-        <span>${transfer.last_event}</span>
-      </div>
-      <p class="muted-line">${transfer.last_message}</p>
-      <div class="action-row">
-        <button class="inline-action" data-pause-adb="${transfer.task_id}" ${canPause ? "" : "disabled"}>Pause Worker</button>
-        <button class="inline-action" data-resume-adb="${transfer.task_id}" ${canResume ? "" : "disabled"}>Resume Worker</button>
+        <div class="progress-bar"><div class="progress-fill" style="width:${progress}%"></div></div>
+        <div class="task-stats">
+          <span>文件 ${completedFiles}/${transfer.total_files}</span>
+          <span>${formatBytes(transfer.bytes_pushed)}</span>
+          <span>${escapeHtml(transfer.last_message || "")}</span>
+        </div>
       </div>
     `;
-    host.appendChild(card);
-  }
-
-  for (const button of host.querySelectorAll("[data-pause-adb]")) {
-    button.addEventListener("click", async (event) => {
-      const taskId = event.currentTarget.getAttribute("data-pause-adb");
-      await pauseAdbTransfer(taskId);
-    });
-  }
-
-  for (const button of host.querySelectorAll("[data-resume-adb]")) {
-    button.addEventListener("click", async (event) => {
-      const taskId = event.currentTarget.getAttribute("data-resume-adb");
-      await resumeAdbTransfer(taskId);
-    });
-  }
+  }).join("");
 }
 
-function renderRecoverables(taskIds) {
+function renderRecoverables(taskIds, tasks = []) {
   const host = document.querySelector("#recoverable-list");
-  host.innerHTML = "";
-  if (!taskIds.length) {
-    host.innerHTML = `<div class="empty-state">No recoverable checkpoints found.</div>`;
+  const currentTaskIds = new Set(tasks.map((task) => task.task_id));
+  const visibleTaskIds = taskIds.filter((taskId) => taskId !== "demo-task" && !currentTaskIds.has(taskId));
+  const loadedRecoverables = tasks.filter((task) =>
+    task.task_id !== "demo-task" && ["Paused", "Failed"].includes(task.state)
+  );
+  if (!visibleTaskIds.length && !loadedRecoverables.length) {
+    host.innerHTML = `<div class="empty-state">没有可恢复的检查点。</div>`;
     return;
   }
 
-  for (const taskId of taskIds) {
-    const row = document.createElement("div");
-    row.className = "recoverable-row";
-    row.innerHTML = `
-      <strong>${taskId}</strong>
-      <button class="inline-action" data-task-id="${taskId}">Recover</button>
-    `;
-    host.appendChild(row);
-  }
-
-  for (const button of host.querySelectorAll("[data-task-id]")) {
-    button.addEventListener("click", async (event) => {
-      const taskId = event.currentTarget.getAttribute("data-task-id");
-      await mutateTask("recover_task", { taskId });
-    });
-  }
-}
-
-function renderModes(modes) {
-  const host = document.querySelector("#mode-list");
-  host.innerHTML = "";
-  for (const mode of modes) {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    chip.textContent = mode;
-    host.appendChild(chip);
-  }
-}
-
-function renderDraftTransportModes(modes) {
-  const select = document.querySelector("#draft-transport-mode");
-  if (!select || !modes?.length) {
-    return;
-  }
-
-  select.innerHTML = "";
-  for (const mode of modes) {
-    const option = document.createElement("option");
-    option.value = mode;
-    option.textContent = mode;
-    select.appendChild(option);
-  }
-}
-
-function renderTemplate(template) {
-  const host = document.querySelector("#task-template");
-  host.innerHTML = `
-    <div class="template-row"><span>Task ID</span><strong>${template.task_id}</strong></div>
-    <div class="template-row"><span>Direction</span><strong>${template.direction}</strong></div>
-    <div class="template-row"><span>Transport</span><strong>${template.transport_mode}</strong></div>
-    <div class="template-row"><span>Verify</span><strong>${template.verify_enabled ? "Enabled" : "Disabled"}</strong></div>
-    <div class="template-row"><span>Chunk</span><strong>${template.chunk_size_mb} MB</strong></div>
-  `;
-}
-
-function renderTasks(tasks) {
-  const host = document.querySelector("#task-list");
-  host.innerHTML = "";
-  for (const task of tasks) {
-    const canStart = ["Pending", "Paused", "Failed"].includes(task.state);
-    const canPause = task.state === "Running";
-    const canRetry = task.state === "Failed" || task.state === "Paused";
-    const canCancel = !["Completed", "Cancelled"].includes(task.state);
-    const card = document.createElement("div");
-    card.className = "task-card";
-    card.innerHTML = `
-      <div class="task-header">
-        <div>
-          <strong>${task.task_id}</strong>
-          <p>${task.direction} / ${task.transport_mode} / ${task.total_files} files</p>
-        </div>
-        <span class="badge ${task.state === "Completed" ? "good" : task.state === "Paused" ? "accent" : ""}">${task.state}</span>
+  const loadedRows = loadedRecoverables.map((task) => `
+    <div class="recoverable-row">
+      <div>
+        <strong>${escapeHtml(task.task_id)}</strong>
+        <p>${escapeHtml(displayState(task.state))}，已加载到传输列表</p>
       </div>
-      <div class="progress-bar">
-        <div class="progress-fill" style="width:${task.progress_percent}%"></div>
-      </div>
-      <div class="task-stats">
-        <span>Progress ${task.progress_percent}%</span>
-        <span>Chunk ${task.completed_chunks}</span>
-        <span>ADB ${formatBytes(task.adb_bytes)}</span>
-        <span>Wi-Fi ${formatBytes(task.wifi_bytes)}</span>
-      </div>
-      ${task.last_error ? `<p class="muted-line error-line">${task.last_error}</p>` : ""}
       <div class="action-row">
-        <button class="inline-action" data-start-task="${task.task_id}" ${canStart ? "" : "disabled"}>Start</button>
-        <button class="inline-action" data-pause-task="${task.task_id}" ${canPause ? "" : "disabled"}>Pause</button>
-        <button class="inline-action" data-resume-task="${task.task_id}" ${task.state === "Paused" ? "" : "disabled"}>Resume</button>
-        <button class="inline-action" data-retry-task="${task.task_id}" ${canRetry ? "" : "disabled"}>Retry</button>
-        <button class="inline-action" data-cancel-task="${task.task_id}" ${canCancel ? "" : "disabled"}>Cancel</button>
+        <button class="secondary-btn" data-resume-task="${escapeHtml(task.task_id)}" ${task.state === "Paused" ? "" : "disabled"}>继续</button>
+        <button class="secondary-btn" data-retry-task="${escapeHtml(task.task_id)}" ${task.state === "Failed" ? "" : "disabled"}>重试</button>
+        <button class="danger-btn" data-delete-task="${escapeHtml(task.task_id)}">删除记录</button>
       </div>
-    `;
-    host.appendChild(card);
-  }
+    </div>
+  `).join("");
 
-  for (const button of host.querySelectorAll("[data-start-task]")) {
+  const orphanRows = visibleTaskIds.map((taskId) => `
+    <div class="recoverable-row">
+      <strong>${escapeHtml(taskId)}</strong>
+      <div class="action-row">
+        <button class="secondary-btn" data-recover-task="${escapeHtml(taskId)}">恢复</button>
+        <button class="danger-btn" data-delete-task="${escapeHtml(taskId)}">删除记录</button>
+      </div>
+    </div>
+  `).join("");
+  host.innerHTML = loadedRows + orphanRows;
+
+  for (const button of host.querySelectorAll("[data-recover-task]")) {
     button.addEventListener("click", async (event) => {
-      await startTransferTask(event.currentTarget.getAttribute("data-start-task"));
+      await mutateTask("recover_task", { taskId: event.currentTarget.dataset.recoverTask });
     });
   }
-  for (const button of host.querySelectorAll("[data-pause-task]")) {
+  for (const button of host.querySelectorAll("[data-delete-task]")) {
     button.addEventListener("click", async (event) => {
-      await mutateTask("pause_transfer_task", { taskId: event.currentTarget.getAttribute("data-pause-task") });
+      await deleteTaskRecord(event.currentTarget.dataset.deleteTask);
     });
   }
-  for (const button of host.querySelectorAll("[data-resume-task]")) {
-    button.addEventListener("click", async (event) => {
-      await resumeTransferTask(event.currentTarget.getAttribute("data-resume-task"));
-    });
-  }
-  for (const button of host.querySelectorAll("[data-retry-task]")) {
-    button.addEventListener("click", async (event) => {
-      await mutateTask("retry_transfer_task", { taskId: event.currentTarget.getAttribute("data-retry-task") });
-    });
-  }
-  for (const button of host.querySelectorAll("[data-cancel-task]")) {
-    button.addEventListener("click", async (event) => {
-      await mutateTask("cancel_transfer_task", { taskId: event.currentTarget.getAttribute("data-cancel-task") });
-    });
+  bindTaskButtons(host);
+}
+
+function bindTaskButtons(host) {
+  const actions = [
+    ["start_transfer_task", "startTask"],
+    ["pause_transfer_task", "pauseTask"],
+    ["resume_transfer_task", "resumeTask"],
+    ["retry_transfer_task", "retryTask"],
+    ["cancel_transfer_task", "cancelTask"],
+    ["delete_transfer_task", "deleteTask"],
+  ];
+  for (const [command, key] of actions) {
+    for (const button of host.querySelectorAll(`[data-${kebab(key)}]`)) {
+      button.addEventListener("click", async (event) => {
+        if (command === "delete_transfer_task") {
+          await deleteTaskRecord(event.currentTarget.dataset[key]);
+        } else {
+          await mutateTask(command, { taskId: event.currentTarget.dataset[key] });
+        }
+      });
+    }
   }
 }
 
-async function startTransferTask(taskId) {
-  if (!invoke) {
-    return;
-  }
-
-  try {
-    await invoke("start_transfer_task", { taskId });
-  } catch (error) {
-    console.error(error);
-  }
-
-  await refreshDashboard();
-}
-
-async function resumeTransferTask(taskId) {
-  if (!invoke) {
-    return;
-  }
-
-  try {
-    await invoke("resume_transfer_task", { taskId });
-  } catch (error) {
-    console.error(error);
-  }
-
-  await refreshDashboard();
-}
-
-function bindActions() {
-  document
-    .querySelector("#create-local-btn")
-    ?.addEventListener("click", () => mutateTask("create_demo_local_task"));
-  document
-    .querySelector("#advance-btn")
-    ?.addEventListener("click", () => mutateTask("tick_demo_task"));
-  document
-    .querySelector("#pause-btn")
-    ?.addEventListener("click", () => mutateTask("pause_demo_task"));
-  document
-    .querySelector("#resume-btn")
-    ?.addEventListener("click", () => mutateTask("resume_demo_task"));
-  document.querySelector("#refresh-devices-btn")?.addEventListener("click", () => refreshDashboard());
-  document.querySelector("#probe-agent-btn")?.addEventListener("click", () => probeAgentHost());
-  document.querySelector("#start-agent-task-btn")?.addEventListener("click", () => startAgentTask());
-  document
-    .querySelector("#pause-agent-task-btn")
-    ?.addEventListener("click", () => mutateAgentTask("pause_wifi_agent_task"));
-  document
-    .querySelector("#resume-agent-task-btn")
-    ?.addEventListener("click", () => mutateAgentTask("resume_wifi_agent_task"));
-  document
-    .querySelector("#push-agent-sample-btn")
-    ?.addEventListener("click", () => pushAgentSampleChunk());
+function bindStaticActions() {
+  document.querySelector("#refresh-devices-btn")?.addEventListener("click", () => refreshDashboard({ includeLogs: false, silent: false }));
+  document.querySelector("#refresh-recover-btn")?.addEventListener("click", () => refreshDashboard({ includeLogs: false, silent: false }));
   document.querySelector("#refresh-logs-btn")?.addEventListener("click", () => refreshLogs());
   document.querySelector("#export-logs-btn")?.addEventListener("click", () => exportLogs());
   document.querySelector("#fetch-agent-logs-btn")?.addEventListener("click", () => fetchAgentLogs());
-  document.querySelector("#draft-form")?.addEventListener("submit", stageDraft);
-  document.querySelector("#draft-direction")?.addEventListener("change", syncDraftDirectionUi);
-  document.querySelector("#draft-transport-mode")?.addEventListener("change", syncDraftDirectionUi);
+  document.querySelector("#probe-agent-btn")?.addEventListener("click", () => probeAgentHost());
   document.querySelector("#pick-source-file-btn")?.addEventListener("click", () => pickDraftSourcePath(false));
   document.querySelector("#pick-source-folder-btn")?.addEventListener("click", () => pickDraftSourcePath(true));
   document.querySelector("#pick-target-folder-btn")?.addEventListener("click", () => pickDraftTargetFolder());
+  document.querySelector("#draft-form")?.addEventListener("submit", stageDraft);
+
+  for (const button of document.querySelectorAll(".segment[data-direction]")) {
+    button.addEventListener("click", () => {
+      setValue("#draft-direction", button.dataset.direction);
+      setSegment(".segment[data-direction]", button.dataset.direction, "direction");
+      syncDraftDirectionUi();
+    });
+  }
+  for (const button of document.querySelectorAll(".segment[data-mode]")) {
+    button.addEventListener("click", () => {
+      setValue("#draft-transport-mode", button.dataset.mode);
+      setSegment(".segment[data-mode]", button.dataset.mode, "mode");
+      syncDraftDirectionUi();
+    });
+  }
+  for (const button of document.querySelectorAll(".nav-item")) {
+    button.addEventListener("click", () => {
+      document.querySelectorAll(".nav-item").forEach((item) => item.classList.remove("active"));
+      button.classList.add("active");
+      document.querySelector(`#${button.dataset.section}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
   syncDraftDirectionUi();
-}
-
-function syncDraftDirectionUi() {
-  const direction = document.querySelector("#draft-direction")?.value || "PC -> Android";
-  const transportMode = document.querySelector("#draft-transport-mode")?.value || "Dual Track";
-  const targetInput = document.querySelector("#draft-target-root");
-  const targetHint = document.querySelector("#draft-target-hint");
-  const targetPicker = document.querySelector("#pick-target-folder-btn");
-  const laneHint = document.querySelector("#draft-lane-hint");
-  const isAndroidToPc = direction === "Android -> PC";
-
-  if (targetInput) {
-    targetInput.placeholder = isAndroidToPc
-      ? "C:\\Users\\me\\Desktop\\NekotransRestore"
-      : "/sdcard/Nekotrans/Pictures";
-  }
-  if (targetHint) {
-    targetHint.textContent = isAndroidToPc
-      ? "Android -> PC uses a local Windows target folder, so the picker can fill this field."
-      : "PC -> Android writes to an Android path; enter the remote target root manually.";
-  }
-  if (targetPicker) {
-    targetPicker.disabled = !isAndroidToPc;
-    targetPicker.title = isAndroidToPc ? "" : "Local folder picker only applies to Android -> PC tasks.";
-  }
-  if (laneHint) {
-    const directionHint = isAndroidToPc
-      ? "Android -> PC uses a local Windows target folder."
-      : "PC -> Android uses a remote Android target root.";
-    const modeHint =
-      transportMode === "ADB-only"
-        ? "ADB-only requires an ADB serial."
-        : transportMode === "Wi-Fi-only"
-          ? "Wi-Fi-only requires an agent host."
-          : "Dual Track uses both lanes when an ADB serial and agent host are available; otherwise it degrades to the available lane.";
-    laneHint.textContent = `${directionHint} ${modeHint}`;
-  }
-}
-
-function validateDraftSummary(summary) {
-  const errors = [];
-  if (!summary.source_path) {
-    errors.push("Source path is required.");
-  }
-  if (!summary.target_root) {
-    errors.push("Target root is required.");
-  }
-  if (summary.transport_mode === "ADB-only" && !summary.device_serial) {
-    errors.push("ADB-only tasks require an ADB serial.");
-  }
-  if (summary.transport_mode === "Wi-Fi-only" && !summary.agent_host) {
-    errors.push("Wi-Fi-only tasks require an agent host.");
-  }
-  if (summary.transport_mode === "Dual Track" && !summary.device_serial && !summary.agent_host) {
-    errors.push("Dual Track currently needs at least one usable lane: ADB serial or agent host.");
-  }
-  if (summary.direction === "PC -> Android" && summary.target_root.includes("\\")) {
-    errors.push("PC -> Android target root should look like an Android path such as /sdcard/Nekotrans.");
-  }
-  if (summary.direction === "Android -> PC" && !summary.target_root.match(/^[A-Za-z]:\\/)) {
-    errors.push("Android -> PC target root should be a local Windows folder.");
-  }
-  return errors;
-}
-
-async function pickDraftSourcePath(pickDirectory) {
-  if (!invoke) {
-    return;
-  }
-
-  try {
-    const path = await invoke("pick_source_path", { pickDirectory });
-    if (path) {
-      document.querySelector("#draft-source-path").value = path;
-    }
-  } catch (error) {
-    document.querySelector("#draft-summary").textContent = String(error);
-  }
-}
-
-async function pickDraftTargetFolder() {
-  if (!invoke) {
-    return;
-  }
-
-  if ((document.querySelector("#draft-direction")?.value || "PC -> Android") !== "Android -> PC") {
-    document.querySelector("#draft-summary").textContent =
-      "Target folder picker is available for Android -> PC tasks only.";
-    return;
-  }
-
-  try {
-    const path = await invoke("pick_target_folder");
-    if (path) {
-      document.querySelector("#draft-target-root").value = path;
-    }
-  } catch (error) {
-    document.querySelector("#draft-summary").textContent = String(error);
-  }
-}
-
-function currentLogFilters() {
-  const fromValue = document.querySelector("#log-from-filter")?.value;
-  const toValue = document.querySelector("#log-to-filter")?.value;
-  return {
-    taskId: document.querySelector("#log-task-filter")?.value.trim() || null,
-    deviceHost: document.querySelector("#log-device-filter")?.value.trim() || null,
-    fromEpochMs: fromValue ? new Date(fromValue).getTime() : null,
-    toEpochMs: toValue ? new Date(toValue).getTime() : null,
-    level: document.querySelector("#log-level-filter")?.value || null,
-    text: document.querySelector("#log-text-filter")?.value.trim() || null,
-  };
-}
-
-async function refreshLogs() {
-  if (!invoke) {
-    return;
-  }
-
-  const filters = currentLogFilters();
-  try {
-    const logs = await invoke("list_task_logs_filtered", filters);
-    document.querySelector("#log-output").textContent = logs.join("\n");
-  } catch (error) {
-    document.querySelector("#log-export-output").textContent = String(error);
-  }
-}
-
-async function exportLogs() {
-  if (!invoke) {
-    return;
-  }
-
-  const filters = currentLogFilters();
-  const output = document.querySelector("#log-export-output");
-  try {
-    const path = await invoke("export_logs", filters);
-    output.textContent = `Exported ${path}`;
-  } catch (error) {
-    output.textContent = String(error);
-  }
-}
-
-async function fetchAgentLogs() {
-  if (!invoke) {
-    return;
-  }
-
-  const host = document.querySelector("#agent-host-input")?.value.trim();
-  const output = document.querySelector("#log-export-output");
-  if (!host) {
-    output.textContent = "Enter a LAN IP first.";
-    return;
-  }
-
-  try {
-    const result = await invoke("fetch_wifi_agent_logs", { host });
-    output.textContent = JSON.stringify(result, null, 2);
-  } catch (error) {
-    output.textContent = String(error);
+  updateDraftStep();
+  for (const selector of ["#draft-source-path", "#draft-target-root", "#draft-device-serial", "#draft-agent-host"]) {
+    document.querySelector(selector)?.addEventListener("input", updateDraftStep);
   }
 }
 
 async function stageDraft(event) {
   event.preventDefault();
+  clearErrors();
 
-  const summary = {
-    source_path: document.querySelector("#draft-source-path")?.value.trim() || "",
-    target_root: document.querySelector("#draft-target-root")?.value.trim() || "",
-    direction: document.querySelector("#draft-direction")?.value || "PC -> Android",
-    transport_mode: document.querySelector("#draft-transport-mode")?.value || "Dual Track",
-    verify_enabled: document.querySelector("#draft-verify")?.checked || false,
-    chunk_size_bytes: Math.max(1, Number(document.querySelector("#draft-chunk-mb")?.value || 8)) * 1024 * 1024,
-    max_in_flight_chunks_per_lane: Math.max(1, Number(document.querySelector("#draft-lane-limit")?.value || 4)),
-    device_serial: document.querySelector("#draft-device-serial")?.value.trim() || null,
-    agent_host:
-      document.querySelector("#draft-agent-host")?.value.trim() ||
-      document.querySelector("#agent-host-input")?.value.trim() ||
-      null,
-    target_path_policy: "preserve_relative",
-    staged_at: new Date().toISOString(),
-  };
-
-  const output = document.querySelector("#draft-summary");
+  const intent = event.submitter?.dataset.intent || "create";
+  const summary = draftSummary();
   const validationErrors = validateDraftSummary(summary);
   if (validationErrors.length) {
-    output.textContent = JSON.stringify({ draft: summary, validation_errors: validationErrors }, null, 2);
-    return;
-  }
-  output.textContent = JSON.stringify(summary, null, 2);
-
-  if (!invoke) {
+    showErrors(validationErrors);
+    updateDraftStep();
     return;
   }
 
-  try {
+  await withBusy(async () => {
     const task = await invoke("create_transfer_task", { draft: summary });
-    output.textContent = JSON.stringify({ draft: summary, task }, null, 2);
-    await refreshDashboard();
-  } catch (error) {
-    output.textContent = JSON.stringify({ draft: summary, error: String(error) }, null, 2);
+    showToast(intent === "start" ? "任务已创建，正在启动..." : "任务已创建。");
+    if (intent === "start") {
+      await invoke("start_transfer_task", { taskId: task.task_id });
+      showToast("传输已启动。");
+    }
+  });
+  await refreshDashboard({ includeLogs: true, silent: false });
+  updateDraftStep();
+}
+
+function draftSummary() {
+  return {
+    source_path: value("#draft-source-path"),
+    target_root: value("#draft-target-root"),
+    direction: value("#draft-direction") || "PC -> Android",
+    transport_mode: value("#draft-transport-mode") || "Dual Track",
+    verify_enabled: document.querySelector("#draft-verify")?.checked || false,
+    chunk_size_bytes: Math.max(1, Number(value("#draft-chunk-mb") || 8)) * 1024 * 1024,
+    max_in_flight_chunks_per_lane: Math.max(1, Number(value("#draft-lane-limit") || 4)),
+    device_serial: value("#draft-device-serial") || null,
+    agent_host: value("#draft-agent-host") || value("#agent-host-input") || null,
+    target_path_policy: "preserve_relative",
+  };
+}
+
+function validateDraftSummary(summary) {
+  const errors = [];
+  if (!summary.source_path) errors.push("请选择来源。");
+  if (!summary.target_root) errors.push("请填写目标。");
+  if (summary.transport_mode === "ADB-only" && !summary.device_serial) errors.push("ADB 需要设备序列号。");
+  if (summary.transport_mode === "Wi-Fi-only" && !summary.agent_host) errors.push("Wi-Fi 需要代理地址。");
+  if (summary.transport_mode === "Dual Track" && (!summary.device_serial || !summary.agent_host)) {
+    errors.push("双通道需要同时具备 ADB 序列号和代理地址。");
+  }
+  if (summary.direction === "PC -> Android" && summary.target_root.includes("\\")) {
+    errors.push("Android 目标路径应类似 /sdcard/Nekotrans。");
+  }
+  return errors;
+}
+
+function updateDraftStep() {
+  const summary = draftSummary();
+  const errors = validateDraftSummary(summary);
+  const sourceInput = document.querySelector("#draft-source-path");
+  sourceInput?.classList.toggle("needs-attention", !summary.source_path);
+  const targetInput = document.querySelector("#draft-target-root");
+  targetInput?.classList.toggle("needs-attention", !summary.target_root);
+  if (!summary.source_path) {
+    text("#draft-step-text", "请选择要发送的文件或文件夹。");
+  } else if (!summary.target_root) {
+    text("#draft-step-text", "请填写目标路径。PC → Android 推荐 /sdcard/Nekotrans。");
+  } else if (errors.length) {
+    text("#draft-step-text", errors[0]);
+  } else {
+    text("#draft-step-text", "准备就绪，可以点击“创建并启动”。");
   }
 }
 
-async function mutateTask(command, payload = undefined) {
-  if (!invoke) {
-    return;
+function syncDraftDirectionUi() {
+  const isAndroidToPc = value("#draft-direction") === "Android -> PC";
+  const targetInput = document.querySelector("#draft-target-root");
+  const targetPicker = document.querySelector("#pick-target-folder-btn");
+  if (targetInput) {
+    targetInput.placeholder = isAndroidToPc ? "C:\\Users\\me\\Desktop\\NekotransRestore" : "/sdcard/Nekotrans";
   }
+  if (targetPicker) {
+    targetPicker.disabled = !isAndroidToPc;
+  }
+}
 
+async function pickDraftSourcePath(pickDirectory) {
+  if (!ensureInvokeReady()) return;
   try {
-    await invoke(command, payload);
+    const path = await invoke("pick_source_path", { pickDirectory });
+    if (path) {
+      setValue("#draft-source-path", path);
+      updateDraftStep();
+    }
   } catch (error) {
-    console.error(error);
+    showToast(String(error), true);
   }
-
-  await refreshDashboard();
 }
 
-async function refreshDashboard() {
-  if (!invoke) {
+async function pickDraftTargetFolder() {
+  if (!ensureInvokeReady()) return;
+  if (value("#draft-direction") !== "Android -> PC") return;
+  try {
+    const path = await invoke("pick_target_folder");
+    if (path) {
+      setValue("#draft-target-root", path);
+      updateDraftStep();
+    }
+  } catch (error) {
+    showToast(String(error), true);
+  }
+}
+
+async function probeAgentHost() {
+  if (!ensureInvokeReady()) return;
+  const host = value("#agent-host-input");
+  if (!host) {
+    showToast("请输入代理地址。", true);
     return;
   }
-
-  const [dashboard, logs, adbTransfers] = await Promise.all([
-    invoke("bootstrap_dashboard"),
-    invoke("list_task_logs_filtered", currentLogFilters()),
-    invoke("list_adb_transfers"),
-  ]);
-  renderDevices(dashboard.devices);
-  renderConnectionOverview(dashboard);
-  renderTasks(dashboard.tasks);
-  renderRecoverables(dashboard.recoverable_tasks);
-  renderAdbTransfers(adbTransfers);
-  document.querySelector("#log-output").textContent = logs.join("\n");
+  await withBusy(async () => {
+    const result = await invoke("probe_wifi_agent", { host });
+    document.querySelector("#agent-probe-output").textContent = compactJson(result);
+    setValue("#draft-agent-host", host);
+    showToast("手机端代理可连接。");
+  });
 }
 
-function formatBytes(value) {
-  const units = ["B", "KB", "MB", "GB"];
-  let size = value;
-  let unitIndex = 0;
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex += 1;
+async function fetchAgentLogs() {
+  if (!ensureInvokeReady({ log: true })) return;
+  const host = value("#agent-host-input") || value("#draft-agent-host");
+  if (!host) {
+    showToast("没有代理地址。", true);
+    return;
   }
-  return `${size.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+  await withBusy(async () => {
+    const result = await invoke("fetch_wifi_agent_logs", { host });
+    document.querySelector("#log-export-output").textContent = compactJson(result);
+    await refreshLogs();
+  });
 }
 
-function escapeHtml(value) {
-  return String(value ?? "")
+async function refreshLogs() {
+  if (!ensureInvokeReady({ log: true })) return;
+  try {
+    const filters = currentLogFilters();
+    const logs = await invoke("list_task_logs_filtered", filters);
+    setLogOutput(logs.join("\n") || "暂无日志。");
+  } catch (error) {
+    const message = `日志读取失败：${String(error)}`;
+    setLogOutput(message);
+    showToast(message, true);
+  }
+}
+
+async function exportLogs() {
+  if (!ensureInvokeReady({ log: true })) return;
+  await withBusy(async () => {
+    const path = await invoke("export_logs", currentLogFilters());
+    document.querySelector("#log-export-output").textContent = `已导出 ${path}`;
+  });
+}
+
+function currentLogFilters() {
+  return {
+    taskId: value("#log-task-filter") || null,
+    deviceHost: value("#log-device-filter") || null,
+    fromEpochMs: null,
+    toEpochMs: null,
+    level: value("#log-level-filter") || null,
+    text: value("#log-text-filter") || null,
+  };
+}
+
+async function mutateTask(command, payload) {
+  await withBusy(async () => {
+    await invoke(command, payload);
+  });
+  await refreshDashboard({ includeLogs: true, silent: false });
+}
+
+async function deleteTaskRecord(taskId) {
+  if (!taskId || taskId === "demo-task") return;
+  await withBusy(async () => {
+    await invoke("delete_transfer_task", { taskId });
+    showToast("传输记录已删除。");
+  });
+  await refreshDashboard({ includeLogs: true, silent: false });
+}
+
+async function withBusy(work) {
+  if (!ensureInvokeReady()) return;
+  if (state.busy) return;
+  state.busy = true;
+  document.body.classList.add("busy");
+  try {
+    await work();
+  } catch (error) {
+    showErrors([String(error)]);
+    showToast(String(error), true);
+  } finally {
+    state.busy = false;
+    document.body.classList.remove("busy");
+  }
+}
+
+function ensureInvokeReady(options = {}) {
+  if (invoke) return true;
+  const message = "Tauri 桥接未启用，桌面端命令不可用。请重新编译并启动 Windows 端。";
+  showErrors([message]);
+  if (options.log) {
+    setLogOutput(message);
+  }
+  setRefreshState("不可用");
+  showToast(message, true);
+  return false;
+}
+
+function setLogOutput(message) {
+  const output = document.querySelector("#log-output");
+  if (output) {
+    output.textContent = message;
+  }
+}
+
+function showErrors(errors) {
+  const box = document.querySelector("#draft-errors");
+  box.innerHTML = errors.map((error) => `<div>${escapeHtml(error)}</div>`).join("");
+  box.hidden = false;
+}
+
+function clearErrors() {
+  const box = document.querySelector("#draft-errors");
+  box.innerHTML = "";
+  box.hidden = true;
+}
+
+function showToast(message, isError = false) {
+  const toast = document.querySelector("#toast");
+  toast.textContent = message;
+  toast.classList.toggle("error", isError);
+  toast.hidden = false;
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => {
+    toast.hidden = true;
+  }, 3200);
+}
+
+function setRefreshState(label) {
+  text("#refresh-state", label);
+}
+
+function setSegment(selector, selected, dataKey) {
+  for (const button of document.querySelectorAll(selector)) {
+    button.classList.toggle("active", button.dataset[dataKey] === selected);
+  }
+}
+
+function text(selector, valueText) {
+  const element = document.querySelector(selector);
+  if (element) element.textContent = String(valueText);
+}
+
+function value(selector) {
+  return document.querySelector(selector)?.value?.trim() || "";
+}
+
+function setValue(selector, nextValue) {
+  const element = document.querySelector(selector);
+  if (element) element.value = nextValue;
+}
+
+function kebab(valueText) {
+  return valueText.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+}
+
+function compactJson(valueObject) {
+  return JSON.stringify(valueObject, null, 2);
+}
+
+function formatBytes(valueText) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = Number(valueText || 0);
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function displayState(stateText) {
+  return {
+    Pending: "待启动",
+    Running: "运行中",
+    Paused: "已暂停",
+    Completed: "已完成",
+    Failed: "失败",
+    Cancelled: "已取消",
+  }[stateText] || stateText;
+}
+
+function displayDirection(directionText) {
+  return {
+    "PC -> Android": "PC → Android",
+    "Android -> PC": "Android → PC",
+  }[directionText] || directionText;
+}
+
+function displayMode(modeText) {
+  return {
+    "Dual Track": "双通道",
+    "ADB-only": "仅 ADB",
+    "Wi-Fi-only": "仅 Wi-Fi",
+  }[modeText] || modeText;
+}
+
+function displayWorkerStage(eventText, messageText, task) {
+  const mapped = {
+    "dual-same-file-started": "正在准备同文件双通道写入。",
+    "dual-same-file-chunk-skipped": "正在校验并跳过已确认的恢复块。",
+    "dual-same-file-chunk-pushed": "正在写入同文件分块。",
+    "dual-file-completed": "文件已完成，正在收尾。",
+    "dual-finalizing": "正在让手机端合并临时文件。",
+    "dual-local-verify": "正在 Windows 端计算源文件 BLAKE3。",
+    "dual-remote-stat": "正在读取手机端文件大小。",
+    "dual-remote-verify": "正在手机端计算目标文件 BLAKE3。",
+    "dual-completed": "传输和校验已完成。",
+    paused: "链路中断，已停在可恢复边界。",
+    failed: "任务失败，请查看错误信息。",
+  };
+  const stage = mapped[eventText] || messageText || eventText || "";
+  if (task?.state === "Running" && task.progress_percent >= 100 && !stage) {
+    return "数据已写完，正在完成文件收尾或校验。";
+  }
+  return stage;
+}
+
+function escapeHtml(valueText) {
+  return String(valueText ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -892,8 +753,3 @@ function escapeHtml(value) {
 }
 
 loadDashboard();
-setInterval(() => {
-  if (invoke) {
-    refreshDashboard();
-  }
-}, 1500);

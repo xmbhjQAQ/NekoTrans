@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.headlineMedium,
                         )
                         Text(
-                            text = "Keep this screen or the foreground notification active while the desktop sends tasks.",
+                            text = "保持前台服务运行，桌面端即可通过 ADB 与 Wi-Fi 下发传输任务。",
                             color = Color(0xFFB6D2DB),
                         )
 
@@ -99,9 +99,9 @@ class MainActivity : ComponentActivity() {
                             ) {
                                 Text(
                                     if (uiState.running) {
-                                        "Foreground Service Running"
+                                        "前台服务运行中"
                                     } else {
-                                        "Start Foreground Service"
+                                        "启动前台服务"
                                     },
                                 )
                             }
@@ -110,7 +110,7 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxWidth(),
                                 onClick = { uiState = readUiState() },
                             ) {
-                                Text("Refresh Status")
+                                Text("刷新状态")
                             }
 
                             Button(
@@ -121,7 +121,7 @@ class MainActivity : ComponentActivity() {
                                     )
                                 },
                             ) {
-                                Text("Grant File Access")
+                                Text("授予文件访问")
                             }
 
                             Button(
@@ -131,7 +131,7 @@ class MainActivity : ComponentActivity() {
                                     uiState = readUiState()
                                 },
                             ) {
-                                Text("Allow Screen-Off Network")
+                                Text("允许熄屏网络")
                             }
                         }
                     }
@@ -146,7 +146,7 @@ class MainActivity : ComponentActivity() {
             running = AgentServer.isRunning(),
             serviceText = AgentServer.statusText(),
             lanAddress = ip,
-            endpointText = if (ip == "Unavailable") "Waiting for Wi-Fi" else "$ip:${AgentServer.PORT}",
+            endpointText = if (ip == "Unavailable") "等待 Wi-Fi" else "$ip:${AgentServer.PORT}",
             allFilesAccess = Environment.isExternalStorageManager(),
             batteryExempt = isIgnoringBatteryOptimizations(),
             task = AgentServer.taskSummary(),
@@ -200,12 +200,12 @@ private fun PairingCard(state: AgentUiState) {
             modifier = Modifier.padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Desktop pairing", fontWeight = FontWeight.Bold)
+            Text("桌面端配对", fontWeight = FontWeight.Bold)
             SelectionContainer {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    StatusRow("Agent Host", state.lanAddress)
-                    StatusRow("Desktop entry", state.endpointText)
-                    StatusRow("Service", state.serviceText)
+                    StatusRow("代理地址", state.lanAddress)
+                    StatusRow("桌面端填写", state.endpointText)
+                    StatusRow("服务", state.serviceText)
                 }
             }
         }
@@ -222,13 +222,13 @@ private fun TaskCard(task: AgentServer.AgentTaskSummary) {
             modifier = Modifier.padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text("Current task", fontWeight = FontWeight.Bold)
-            StatusRow("Task ID", task.taskId)
-            StatusRow("State", task.state)
-            StatusRow("Files", task.files)
-            StatusRow("Chunks", task.chunks)
-            StatusRow("Bytes", task.bytes)
-            StatusRow("Last path", task.lastPath)
+            Text("当前任务", fontWeight = FontWeight.Bold)
+            StatusRow("任务 ID", task.taskId)
+            StatusRow("状态", displayTaskState(task.state))
+            StatusRow("文件", task.files)
+            StatusRow("分块", task.chunks)
+            StatusRow("字节", task.bytes)
+            StatusRow("最近路径", task.lastPath)
             Text(task.message, color = Color(0xFF5D7480))
         }
     }
@@ -244,13 +244,13 @@ private fun PermissionCard(state: AgentUiState) {
             modifier = Modifier.padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text("Runtime readiness", fontWeight = FontWeight.Bold)
-            StatusRow("All Files Access", if (state.allFilesAccess) "Granted" else "Required")
+            Text("运行准备", fontWeight = FontWeight.Bold)
+            StatusRow("所有文件访问", if (state.allFilesAccess) "已授权" else "需要授权")
             StatusRow(
-                "Battery Optimization",
-                if (state.batteryExempt) "Exempt" else "May restrict screen-off LAN",
+                "电池优化",
+                if (state.batteryExempt) "已放行" else "可能限制熄屏网络",
             )
-            StatusRow("Wake/Wi-Fi Locks", if (state.running) "Held by service" else "Not held")
+            StatusRow("唤醒 / Wi-Fi 锁", if (state.running) "服务已持有" else "未持有")
         }
     }
 }
@@ -288,4 +288,15 @@ private fun localLanAddress(): String? {
                     address.matches(Regex("""172\.(1[6-9]|2\d|3[0-1])\..*"""))
             }
     }.getOrNull()
+}
+
+private fun displayTaskState(state: String): String {
+    return when (state) {
+        "Idle" -> "空闲"
+        "Running" -> "运行中"
+        "Paused" -> "已暂停"
+        "Cancelled" -> "已取消"
+        "Completed" -> "已完成"
+        else -> state
+    }
 }

@@ -342,6 +342,27 @@ impl TransferEngine {
         lane: LaneAssignment,
         was_skipped: bool,
     ) -> Result<TransferUpdate, TransferEngineError> {
+        self.record_real_chunk_commit_inner(task_id, chunk, lane, was_skipped, true)
+    }
+
+    pub fn record_real_chunk_commit_pending(
+        &mut self,
+        task_id: &str,
+        chunk: ChunkDescriptor,
+        lane: LaneAssignment,
+        was_skipped: bool,
+    ) -> Result<TransferUpdate, TransferEngineError> {
+        self.record_real_chunk_commit_inner(task_id, chunk, lane, was_skipped, false)
+    }
+
+    fn record_real_chunk_commit_inner(
+        &mut self,
+        task_id: &str,
+        chunk: ChunkDescriptor,
+        lane: LaneAssignment,
+        was_skipped: bool,
+        complete_if_drained: bool,
+    ) -> Result<TransferUpdate, TransferEngineError> {
         let task = self
             .tasks
             .get_mut(task_id)
@@ -351,7 +372,9 @@ impl TransferEngine {
         task.state = TaskState::Running;
         task.checkpoint.checkpoint.state = TaskState::Running;
         task.commit_chunk(chunk, lane, was_skipped);
-        task.mark_completed_if_drained();
+        if complete_if_drained {
+            task.mark_completed_if_drained();
+        }
         task.persist(&self.checkpoint_store)?;
 
         Ok(TransferUpdate {
@@ -589,6 +612,66 @@ impl TransferEngine {
         self.checkpoint_store
             .load(task_id)
             .map_err(|err| TransferEngineError::Persistence(err.to_string()))
+    }
+
+    pub fn delete_task_record(&mut self, task_id: &str) -> Result<(), TransferEngineError> {
+        if let Some(task) = self.tasks.get(task_id) {
+            if task.state == TaskState::Running {
+                return Err(TransferEngineError::InvalidState(format!(
+                    "task {task_id} is running; cancel it before deleting the record"
+                )));
+            }
+        }
+        self.tasks.remove(task_id);
+        self.checkpoint_store
+            .delete(task_id)
+            .map_err(|err| TransferEngineError::Persistence(err.to_string()))
+    }
+
+    pub fn reconfigure_task_chunk_size(
+        &mut self,
+        task_id: &str,
+        chunk_size_bytes: u64,
+    ) -> Result<EngineTaskSnapshot, TransferEngineError> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| TransferEngineError::UnknownTask(task_id.to_string()))?;
+        let chunk_size_bytes = chunk_size_bytes.max(1);
+        task.config.chunk_size_bytes = chunk_size_bytes;
+        task.checkpoint.config.chunk_size_bytes = chunk_size_bytes;
+        let completed_chunks_by_file = task
+            .checkpoint
+            .checkpoint
+            .files
+            .iter()
+            .map(|file| file.completed_chunks.clone())
+            .collect::<Vec<_>>();
+        let completed_chunk_lanes_by_file = task
+            .checkpoint
+            .checkpoint
+            .files
+            .iter()
+            .map(|file| file.completed_chunk_lanes.clone())
+            .collect::<Vec<_>>();
+        task.scheduler =
+            Scheduler::new_with_completed(&task.config, &task.items, &completed_chunks_by_file);
+        task.metrics = rebuild_metrics(
+            &task.config,
+            &task.items,
+            &completed_chunks_by_file,
+            &completed_chunk_lanes_by_file,
+        );
+        task.logs.push(
+            LogRecord::new(
+                LogLevel::Warn,
+                LogScope::Audit,
+                format!("task chunk size reconfigured to {chunk_size_bytes} bytes"),
+            )
+            .with_task_id(task_id),
+        );
+        task.persist(&self.checkpoint_store)?;
+        Ok(task.snapshot())
     }
 
     pub fn log_lines(&self, task_id: &str) -> Result<Vec<String>, TransferEngineError> {

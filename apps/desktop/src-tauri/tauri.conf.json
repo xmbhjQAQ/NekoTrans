@@ -7,6 +7,7 @@
     "frontendDist": "../ui"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Nekotrans",
@@ -22,4 +23,3 @@
     "active": false
   }
 }
-

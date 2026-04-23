@@ -78,6 +78,15 @@ impl CheckpointStore {
         deserialize_entry(&content)
     }
 
+    pub fn delete(&self, task_id: &str) -> Result<(), CheckpointError> {
+        let path = self.root.join(format!("{task_id}.ckpt"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn list(&self) -> Result<Vec<PathBuf>, CheckpointError> {
         if !self.root.exists() {
             return Ok(Vec::new());

@@ -194,6 +194,14 @@ fn create_transfer_task(
     {
         config.max_in_flight_chunks_per_lane = limit;
     }
+    if direction == Direction::PcToAndroid && transport_mode == TransportMode::Dual {
+        if let Some(chunk_size_bytes) =
+            same_file_dual_task_chunk_size(&source_path, config.chunk_size_bytes)?
+        {
+            config.chunk_size_bytes = chunk_size_bytes;
+        }
+    }
+    let actual_chunk_size_bytes = config.chunk_size_bytes;
 
     let mut engine = engine.0.lock().map_err(|err| err.to_string())?;
     let android_source_size = if direction == Direction::AndroidToPc {
@@ -231,7 +239,9 @@ fn create_transfer_task(
             .create_or_recover_task_from_paths(config, &selected_paths)
             .map_err(|err| err.to_string())?
     };
-    TaskFileRecord::from_draft(&draft, &snapshot.task_id).persist()?;
+    let mut record = TaskFileRecord::from_draft(&draft, &snapshot.task_id);
+    record.chunk_size_bytes = Some(actual_chunk_size_bytes);
+    record.persist()?;
     Ok(TaskCard::from(snapshot))
 }
 
@@ -246,7 +256,18 @@ fn list_tasks(engine: State<'_, DesktopEngine>) -> Result<Vec<TaskCard>, String>
 fn cancel_transfer_task(
     task_id: String,
     engine: State<'_, DesktopEngine>,
+    registry: State<'_, AdbTransferRegistry>,
 ) -> Result<TaskCard, String> {
+    if let Ok(mut transfers) = registry.0.lock() {
+        if let Some(entry) = transfers.get_mut(&task_id) {
+            entry.pause_requested.store(true, Ordering::Relaxed);
+            entry.view.state = "Cancelled".to_string();
+            entry.view.last_event = "cancelled".to_string();
+            entry.view.last_message =
+                "cancel requested; stopping the active worker at the next safe boundary"
+                    .to_string();
+        }
+    }
     let mut engine = engine.0.lock().map_err(|err| err.to_string())?;
     let snapshot = engine
         .cancel_task(&task_id)
@@ -303,6 +324,39 @@ fn recover_task(task_id: String, engine: State<'_, DesktopEngine>) -> Result<Tas
         .recover_task(&task_id)
         .map_err(|err| err.to_string())?;
     Ok(TaskCard::from(snapshot))
+}
+
+#[tauri::command]
+fn delete_transfer_task(
+    task_id: String,
+    engine: State<'_, DesktopEngine>,
+    registry: State<'_, AdbTransferRegistry>,
+) -> Result<(), String> {
+    if task_id == "demo-task" {
+        return Ok(());
+    }
+
+    {
+        let transfers = registry.0.lock().map_err(|err| err.to_string())?;
+        if let Some(entry) = transfers.get(&task_id) {
+            if entry.view.state == "Running" || entry.view.state == "Pausing" {
+                return Err("任务正在运行，请先取消后再删除记录。".to_string());
+            }
+        }
+    }
+
+    {
+        let mut engine = engine.0.lock().map_err(|err| err.to_string())?;
+        engine
+            .delete_task_record(&task_id)
+            .map_err(|err| err.to_string())?;
+    }
+
+    TaskFileRecord::delete(&task_id)?;
+    if let Ok(mut transfers) = registry.0.lock() {
+        transfers.remove(&task_id);
+    }
+    Ok(())
 }
 
 fn recover_persisted_task_records(engine: &mut TransferEngine) -> Result<(), String> {
@@ -458,7 +512,7 @@ fn start_transfer_task(
 }
 
 fn start_dual_pc_to_android_from_record(
-    record: TaskFileRecord,
+    mut record: TaskFileRecord,
     registry: State<'_, AdbTransferRegistry>,
     engine: State<'_, DesktopEngine>,
 ) -> Result<AdbTransferCard, String> {
@@ -481,6 +535,24 @@ fn start_dual_pc_to_android_from_record(
     let (adb_files, wifi_files, same_file_dual_files) = partition_dual_transfer_files(files);
     if directories.is_empty() && wifi_files.is_empty() && same_file_dual_files.is_empty() {
         return start_adb_transfer_from_record(record, registry, engine);
+    }
+    if let Some(required_chunk_size) = same_file_dual_files
+        .iter()
+        .map(|file| {
+            dual_same_file_chunk_size(
+                file.size_bytes,
+                record.chunk_size_bytes.unwrap_or(8 * 1024 * 1024),
+            )
+        })
+        .max()
+    {
+        if record.chunk_size_bytes.unwrap_or(8 * 1024 * 1024) != required_chunk_size {
+            if let Ok(mut engine) = engine.0.lock() {
+                let _ = engine.reconfigure_task_chunk_size(&record.task_id, required_chunk_size);
+            }
+            record.chunk_size_bytes = Some(required_chunk_size);
+            let _ = record.persist();
+        }
     }
 
     let task_id = record.task_id.clone();
@@ -607,40 +679,106 @@ fn start_dual_pc_to_android_from_record(
             }
         };
 
-        if let Ok(mut transfers) = worker_registry.lock() {
-            if let Some(entry) = transfers.get_mut(&worker_task_id) {
-                match &result {
-                    Ok(message) => {
-                        entry.view.state = "Completed".to_string();
-                        entry.view.last_event = "dual-completed".to_string();
-                        entry.view.last_message = message.clone();
-                    }
-                    Err(message) => {
-                        if message.contains("paused") {
-                            entry.view.state = "Paused".to_string();
-                            entry.view.last_event = "paused".to_string();
-                        } else {
-                            entry.view.state = "Failed".to_string();
-                            entry.view.last_event = "failed".to_string();
-                        }
-                        entry.view.last_message = message.clone();
-                    }
-                }
-            }
-        }
-
-        if let Err(message) = result {
-            if let Ok(mut engine) = worker_engine.lock() {
-                if message.contains("paused") {
-                    let _ = engine.pause_task(&worker_task_id);
-                } else {
-                    let _ = engine.record_task_failure(&worker_task_id, message);
-                }
-            }
-        }
+        settle_worker_result(
+            &worker_registry,
+            &worker_engine,
+            &worker_task_id,
+            &result,
+            "dual-completed",
+        );
     });
 
     Ok(view)
+}
+
+fn settle_worker_result(
+    registry: &Arc<Mutex<BTreeMap<String, AdbTransferEntry>>>,
+    engine: &Arc<Mutex<TransferEngine>>,
+    task_id: &str,
+    result: &Result<String, String>,
+    completed_event: &str,
+) {
+    let cancelled = task_is_cancelled(engine, task_id);
+    if let Ok(mut transfers) = registry.lock() {
+        if let Some(entry) = transfers.get_mut(task_id) {
+            match result {
+                _ if cancelled => {
+                    entry.view.state = "Cancelled".to_string();
+                    entry.view.last_event = "cancelled".to_string();
+                    entry.view.last_message = "task cancelled by user".to_string();
+                }
+                Ok(message) => {
+                    entry.view.state = "Completed".to_string();
+                    entry.view.last_event = completed_event.to_string();
+                    entry.view.last_message = message.clone();
+                }
+                Err(message) => {
+                    if is_recoverable_transfer_interruption(message) {
+                        entry.view.state = "Paused".to_string();
+                        entry.view.last_event = "paused".to_string();
+                    } else {
+                        entry.view.state = "Failed".to_string();
+                        entry.view.last_event = "failed".to_string();
+                    }
+                    entry.view.last_message = message.clone();
+                }
+            }
+        }
+    }
+
+    if cancelled {
+        return;
+    }
+
+    if let Err(message) = result {
+        if let Ok(mut engine) = engine.lock() {
+            if is_recoverable_transfer_interruption(message) {
+                let _ = engine.pause_task(task_id);
+            } else {
+                let _ = engine.record_task_failure(task_id, message.clone());
+            }
+        }
+    }
+}
+
+fn is_recoverable_transfer_interruption(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.contains("暂停")
+        || message.contains("管道已结束")
+        || message.contains("由于连接方在一段时间后没有正确答复")
+        || message.contains("连接尝试失败")
+        || lower.contains("paused")
+        || lower.contains("os error 109")
+        || lower.contains("os error 10060")
+        || lower.contains("os error 10061")
+        || lower.contains("connection refused")
+        || lower.contains("device offline")
+        || lower.contains("device not found")
+        || lower.contains("no devices/emulators found")
+        || lower.contains("closed")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+}
+
+fn lane_interrupted_message(lane: &str, error: impl std::fmt::Display) -> String {
+    format!(
+        "transfer paused: {lane} lane interrupted; resume will verify committed chunks before skipping them. {error}"
+    )
+}
+
+fn task_is_cancelled(engine: &Arc<Mutex<TransferEngine>>, task_id: &str) -> bool {
+    engine
+        .lock()
+        .ok()
+        .and_then(|engine| {
+            engine
+                .snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.task_id == task_id)
+        })
+        .map(|snapshot| snapshot.state == TaskState::Cancelled)
+        .unwrap_or(false)
 }
 
 fn start_adb_transfer_from_record(
@@ -761,39 +899,13 @@ fn start_adb_transfer_from_record(
             Ok(message)
         });
 
-        if let Ok(mut transfers) = worker_registry.lock() {
-            if let Some(entry) = transfers.get_mut(&worker_task_id) {
-                match &result {
-                    Ok(message) => {
-                        entry.view.state = "Completed".to_string();
-                        entry.view.last_event = "completed".to_string();
-                        entry.view.last_message = message.clone();
-                    }
-                    Err(message) => {
-                        if message.contains("paused") {
-                            entry.view.state = "Paused".to_string();
-                            entry.view.last_event = "paused".to_string();
-                        } else {
-                            entry.view.state = "Failed".to_string();
-                            entry.view.last_event = "failed".to_string();
-                        }
-                        entry.view.last_message = message.clone();
-                    }
-                }
-            }
-        }
-
-        if let Err(message) = &result {
-            if message.contains("paused") {
-                if let Ok(mut engine) = worker_engine.lock() {
-                    let _ = engine.pause_task(&worker_task_id);
-                }
-            } else {
-                if let Ok(mut engine) = worker_engine.lock() {
-                    let _ = engine.record_task_failure(&worker_task_id, message.clone());
-                }
-            }
-        }
+        settle_worker_result(
+            &worker_registry,
+            &worker_engine,
+            &worker_task_id,
+            &result,
+            "completed",
+        );
     });
 
     Ok(view)
@@ -853,37 +965,13 @@ fn start_adb_pull_from_record(
             )
         };
 
-        if let Ok(mut transfers) = worker_registry.lock() {
-            if let Some(entry) = transfers.get_mut(&worker_task_id) {
-                match &result {
-                    Ok(message) => {
-                        entry.view.state = "Completed".to_string();
-                        entry.view.last_event = "completed".to_string();
-                        entry.view.last_message = message.clone();
-                    }
-                    Err(message) => {
-                        if message.contains("paused") {
-                            entry.view.state = "Paused".to_string();
-                            entry.view.last_event = "paused".to_string();
-                        } else {
-                            entry.view.state = "Failed".to_string();
-                            entry.view.last_event = "failed".to_string();
-                        }
-                        entry.view.last_message = message.clone();
-                    }
-                }
-            }
-        }
-
-        if let Err(message) = result {
-            if let Ok(mut engine) = worker_engine.lock() {
-                if message.contains("paused") {
-                    let _ = engine.pause_task(&worker_task_id);
-                } else {
-                    let _ = engine.record_task_failure(&worker_task_id, message);
-                }
-            }
-        }
+        settle_worker_result(
+            &worker_registry,
+            &worker_engine,
+            &worker_task_id,
+            &result,
+            "completed",
+        );
     });
 
     Ok(view)
@@ -951,37 +1039,13 @@ fn start_wifi_transfer_from_record(
             worker_engine.clone(),
         );
 
-        if let Ok(mut transfers) = worker_registry.lock() {
-            if let Some(entry) = transfers.get_mut(&worker_task_id) {
-                match &result {
-                    Ok(message) => {
-                        entry.view.state = "Completed".to_string();
-                        entry.view.last_event = "completed".to_string();
-                        entry.view.last_message = message.clone();
-                    }
-                    Err(message) => {
-                        if message.contains("paused") {
-                            entry.view.state = "Paused".to_string();
-                            entry.view.last_event = "paused".to_string();
-                        } else {
-                            entry.view.state = "Failed".to_string();
-                            entry.view.last_event = "failed".to_string();
-                        }
-                        entry.view.last_message = message.clone();
-                    }
-                }
-            }
-        }
-
-        if let Err(message) = result {
-            if let Ok(mut engine) = worker_engine.lock() {
-                if message.contains("paused") {
-                    let _ = engine.pause_task(&worker_task_id);
-                } else {
-                    let _ = engine.record_task_failure(&worker_task_id, message);
-                }
-            }
-        }
+        settle_worker_result(
+            &worker_registry,
+            &worker_engine,
+            &worker_task_id,
+            &result,
+            "completed",
+        );
     });
 
     Ok(view)
@@ -1043,37 +1107,13 @@ fn start_wifi_pull_from_record(
             worker_engine.clone(),
         );
 
-        if let Ok(mut transfers) = worker_registry.lock() {
-            if let Some(entry) = transfers.get_mut(&worker_task_id) {
-                match &result {
-                    Ok(message) => {
-                        entry.view.state = "Completed".to_string();
-                        entry.view.last_event = "completed".to_string();
-                        entry.view.last_message = message.clone();
-                    }
-                    Err(message) => {
-                        if message.contains("paused") {
-                            entry.view.state = "Paused".to_string();
-                            entry.view.last_event = "paused".to_string();
-                        } else {
-                            entry.view.state = "Failed".to_string();
-                            entry.view.last_event = "failed".to_string();
-                        }
-                        entry.view.last_message = message.clone();
-                    }
-                }
-            }
-        }
-
-        if let Err(message) = result {
-            if let Ok(mut engine) = worker_engine.lock() {
-                if message.contains("paused") {
-                    let _ = engine.pause_task(&worker_task_id);
-                } else {
-                    let _ = engine.record_task_failure(&worker_task_id, message);
-                }
-            }
-        }
+        settle_worker_result(
+            &worker_registry,
+            &worker_engine,
+            &worker_task_id,
+            &result,
+            "completed",
+        );
     });
 
     Ok(view)
@@ -1835,6 +1875,8 @@ fn run_dual_same_file_pc_to_android_files(
             &resolved_target_root,
             &PathBuf::from(format!("{relative_path}.nekotrans-tmp")),
         );
+        let remote_final_file =
+            adb::remote_path_join(&resolved_target_root, &PathBuf::from(&relative_path));
         note_dual_file_started(
             &registry,
             task_id,
@@ -1847,8 +1889,24 @@ fn run_dual_same_file_pc_to_android_files(
 
         let file_chunk_size = dual_same_file_chunk_size(file.size_bytes, chunk_size);
         let wifi_stride = lane_plan.wifi_stride;
-        let completed_chunks = completed_chunks_for_file(checkpoint.as_ref(), file.file_index);
         let total_chunks = chunk_count_for_size(file.size_bytes, file_chunk_size);
+        let completed_chunks = completed_chunks_for_file(checkpoint.as_ref(), file.file_index);
+        if completed_chunks.is_empty() {
+            let _ = adb::remove_remote_path(serial, &remote_temp_file);
+            let _ = adb::remove_remote_path(serial, &remote_final_file);
+        }
+        let completed_chunks = prepare_same_file_resume_chunks(
+            host,
+            task_id,
+            &file.local_path,
+            &relative_path,
+            file_chunk_size,
+            total_chunks,
+            wifi_stride,
+            completed_chunks,
+            &registry,
+            &aggregate,
+        )?;
         let adb_result = run_dual_same_file_lane(
             DualSameFileLane::Adb,
             serial,
@@ -1861,7 +1919,7 @@ fn run_dual_same_file_pc_to_android_files(
             total_chunks,
             wifi_stride,
             lane_plan.wifi_batch_chunks,
-            &completed_chunks,
+            completed_chunks.as_slice(),
             pause_requested.clone(),
             registry.clone(),
             engine.clone(),
@@ -1879,7 +1937,7 @@ fn run_dual_same_file_pc_to_android_files(
             total_chunks,
             wifi_stride,
             lane_plan.wifi_batch_chunks,
-            &completed_chunks,
+            completed_chunks.as_slice(),
             pause_requested.clone(),
             registry.clone(),
             engine.clone(),
@@ -1899,7 +1957,61 @@ fn run_dual_same_file_pc_to_android_files(
         adb_result?;
         wifi_result?;
 
+        note_dual_stage(
+            &registry,
+            task_id,
+            &aggregate,
+            "dual-finalizing",
+            "正在让手机端合并临时文件",
+        );
         agent::complete_file(host, &relative_path).map_err(|err| err.to_string())?;
+        let local_digest = if verify_enabled {
+            note_dual_stage(
+                &registry,
+                task_id,
+                &aggregate,
+                "dual-local-verify",
+                "正在 Windows 端计算源文件 BLAKE3",
+            );
+            Some(blake3_digest_file(&file.local_path)?)
+        } else {
+            None
+        };
+        note_dual_stage(
+            &registry,
+            task_id,
+            &aggregate,
+            "dual-remote-stat",
+            "正在读取手机端文件大小",
+        );
+        let stat = agent::stat_file(host, &relative_path).map_err(|err| err.to_string())?;
+        let remote_size = json_u64_field(&stat.payload, "size_bytes")
+            .ok_or_else(|| format!("agent stat did not include size_bytes: {}", stat.payload))?;
+        if remote_size != file.size_bytes {
+            return Err(format!(
+                "same-file Dual size mismatch for {relative_path}: local={} remote={remote_size}",
+                file.size_bytes
+            ));
+        }
+        if let Some(local_digest) = local_digest {
+            note_dual_stage(
+                &registry,
+                task_id,
+                &aggregate,
+                "dual-remote-verify",
+                "正在手机端计算目标文件 BLAKE3",
+            );
+            let verify = agent::verify_file(host, &relative_path).map_err(|err| err.to_string())?;
+            ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
+            let remote_digest = json_string_field(&verify.payload, "digest").ok_or_else(|| {
+                format!("agent verify did not include digest: {}", verify.payload)
+            })?;
+            if local_digest != remote_digest {
+                return Err(format!(
+                    "same-file Dual verify failed for {relative_path}: local={local_digest} remote={remote_digest}"
+                ));
+            }
+        }
         if let Ok(mut engine) = engine.lock() {
             let _ = engine.record_real_file_complete(
                 task_id,
@@ -1916,33 +2028,6 @@ fn run_dual_same_file_pc_to_android_files(
             &remote_temp_file,
             false,
         );
-
-        let local_digest = if verify_enabled {
-            Some(blake3_digest_file(&file.local_path)?)
-        } else {
-            None
-        };
-        let stat = agent::stat_file(host, &relative_path).map_err(|err| err.to_string())?;
-        let remote_size = json_u64_field(&stat.payload, "size_bytes")
-            .ok_or_else(|| format!("agent stat did not include size_bytes: {}", stat.payload))?;
-        if remote_size != file.size_bytes {
-            return Err(format!(
-                "same-file Dual size mismatch for {relative_path}: local={} remote={remote_size}",
-                file.size_bytes
-            ));
-        }
-        if let Some(local_digest) = local_digest {
-            let verify = agent::verify_file(host, &relative_path).map_err(|err| err.to_string())?;
-            ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
-            let remote_digest = json_string_field(&verify.payload, "digest").ok_or_else(|| {
-                format!("agent verify did not include digest: {}", verify.payload)
-            })?;
-            if local_digest != remote_digest {
-                return Err(format!(
-                    "same-file Dual verify failed for {relative_path}: local={local_digest} remote={remote_digest}"
-                ));
-            }
-        }
         completed_files += 1;
     }
 
@@ -2058,36 +2143,22 @@ fn run_dual_same_file_lane<'a>(
                 length: chunk_length,
             };
             if completed_chunks.contains(&chunk_index) {
-                note_dual_adb_progress(
-                    &registry,
-                    task_id,
-                    &aggregate,
-                    relative_path,
-                    remote_temp_file,
-                    "dual-same-file-chunk-skipped",
-                    &format!("{} chunk {chunk_index} already committed", lane.label()),
-                    chunk_length,
-                    true,
-                    false,
-                );
-                if let Ok(mut engine) = engine.lock() {
-                    let _ =
-                        engine.record_real_chunk_commit(task_id, chunk, lane.assignment(), true);
-                }
                 continue;
             }
 
             match lane {
                 DualSameFileLane::Adb => {
-                    adb::write_file_chunk_at_offset(
+                    if let Err(error) = adb::write_file_chunk_at_offset(
                         serial,
                         &file.local_path,
                         remote_temp_file,
                         chunk_index,
                         offset,
                         chunk_length,
-                    )
-                    .map_err(|err| err.to_string())?;
+                    ) {
+                        pause_requested.store(true, Ordering::Relaxed);
+                        return Err(lane_interrupted_message(lane.label(), error));
+                    }
                 }
                 DualSameFileLane::Wifi => {
                     input
@@ -2103,7 +2174,7 @@ fn run_dual_same_file_lane<'a>(
                         payload: buffer[..read].to_vec(),
                     });
                     if pending_wifi_chunks.len() >= wifi_batch_chunks {
-                        flush_same_file_wifi_batch(
+                        if let Err(error) = flush_same_file_wifi_batch(
                             host,
                             task_id,
                             relative_path,
@@ -2112,7 +2183,10 @@ fn run_dual_same_file_lane<'a>(
                             &registry,
                             &engine,
                             &aggregate,
-                        )?;
+                        ) {
+                            pause_requested.store(true, Ordering::Relaxed);
+                            return Err(lane_interrupted_message(lane.label(), error));
+                        }
                     }
                     continue;
                 }
@@ -2131,12 +2205,17 @@ fn run_dual_same_file_lane<'a>(
                 true,
             );
             if let Ok(mut engine) = engine.lock() {
-                let _ = engine.record_real_chunk_commit(task_id, chunk, lane.assignment(), false);
+                let _ = engine.record_real_chunk_commit_pending(
+                    task_id,
+                    chunk,
+                    lane.assignment(),
+                    false,
+                );
             }
         }
 
         if lane == DualSameFileLane::Wifi {
-            flush_same_file_wifi_batch(
+            if let Err(error) = flush_same_file_wifi_batch(
                 host,
                 task_id,
                 relative_path,
@@ -2145,7 +2224,10 @@ fn run_dual_same_file_lane<'a>(
                 &registry,
                 &engine,
                 &aggregate,
-            )?;
+            ) {
+                pause_requested.store(true, Ordering::Relaxed);
+                return Err(lane_interrupted_message(lane.label(), error));
+            }
         }
 
         Ok(())
@@ -2394,8 +2476,12 @@ fn flush_same_file_wifi_batch(
             true,
         );
         if let Ok(mut engine) = engine.lock() {
-            let _ =
-                engine.record_real_chunk_commit(task_id, chunk.chunk, LaneAssignment::Wifi, false);
+            let _ = engine.record_real_chunk_commit_pending(
+                task_id,
+                chunk.chunk,
+                LaneAssignment::Wifi,
+                false,
+            );
         }
     }
 
@@ -2529,6 +2615,20 @@ fn note_dual_file_finished(
         } else {
             aggregate.pushed_files += 1;
         }
+        sync_dual_card_from_aggregate(registry, task_id, &aggregate, "Running");
+    }
+}
+
+fn note_dual_stage(
+    registry: &Arc<Mutex<BTreeMap<String, AdbTransferEntry>>>,
+    task_id: &str,
+    aggregate: &Arc<Mutex<DualTransferAggregate>>,
+    event: &str,
+    message: &str,
+) {
+    if let Ok(mut aggregate) = aggregate.lock() {
+        aggregate.last_event = event.to_string();
+        aggregate.last_message = message.to_string();
         sync_dual_card_from_aggregate(registry, task_id, &aggregate, "Running");
     }
 }
@@ -3126,7 +3226,11 @@ fn default_docs_path() -> Result<PathBuf, String> {
 }
 
 fn nekotrans_state_root() -> PathBuf {
-    PathBuf::from(".nekotrans")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join(".nekotrans")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3778,6 +3882,145 @@ fn completed_chunks_for_file(checkpoint: Option<&CheckpointEntry>, file_index: u
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_same_file_resume_chunks(
+    host: &str,
+    task_id: &str,
+    local_path: &Path,
+    relative_path: &str,
+    chunk_size: u64,
+    total_chunks: u32,
+    wifi_stride: u32,
+    completed_chunks: Vec<u32>,
+    registry: &Arc<Mutex<BTreeMap<String, AdbTransferEntry>>>,
+    aggregate: &Arc<Mutex<DualTransferAggregate>>,
+) -> Result<Vec<u32>, String> {
+    let mut chunks = completed_chunks
+        .into_iter()
+        .filter(|chunk_index| *chunk_index < total_chunks)
+        .collect::<BTreeSet<_>>();
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    note_dual_stage(
+        registry,
+        task_id,
+        aggregate,
+        "dual-same-file-resume-check",
+        &format!(
+            "quick resume guard: checking {} of {} checkpointed chunks",
+            same_file_resume_guard_chunks(&chunks, wifi_stride).len(),
+            chunks.len()
+        ),
+    );
+
+    let mut guards_ok = true;
+    for chunk_index in same_file_resume_guard_chunks(&chunks, wifi_stride) {
+        let offset = chunk_index as u64 * chunk_size;
+        let length = chunk_length_for(
+            local_path.metadata().map_err(|err| err.to_string())?.len(),
+            chunk_size,
+            chunk_index,
+        );
+        if !verify_same_file_checkpoint_chunk(host, local_path, relative_path, offset, length)? {
+            guards_ok = false;
+            break;
+        }
+    }
+
+    if guards_ok {
+        note_dual_stage(
+            registry,
+            task_id,
+            aggregate,
+            "dual-same-file-resume-check",
+            "resume guard passed; trusting checkpoint and continuing transfer",
+        );
+        return Ok(chunks.into_iter().collect());
+    }
+
+    note_dual_stage(
+        registry,
+        task_id,
+        aggregate,
+        "dual-same-file-resume-scan",
+        "resume guard mismatch; scanning checkpoint chunks before rewrite",
+    );
+    let mut verified = BTreeSet::new();
+    for chunk_index in chunks.iter().copied() {
+        let offset = chunk_index as u64 * chunk_size;
+        let length = chunk_length_for(
+            local_path.metadata().map_err(|err| err.to_string())?.len(),
+            chunk_size,
+            chunk_index,
+        );
+        if verify_same_file_checkpoint_chunk(host, local_path, relative_path, offset, length)? {
+            verified.insert(chunk_index);
+        }
+    }
+    chunks = verified;
+    Ok(chunks.into_iter().collect())
+}
+
+fn same_file_resume_guard_chunks(completed_chunks: &BTreeSet<u32>, wifi_stride: u32) -> Vec<u32> {
+    let mut guards = BTreeSet::new();
+    if let Some(first) = completed_chunks.iter().next() {
+        guards.insert(*first);
+    }
+    if let Some(last) = completed_chunks.iter().next_back() {
+        guards.insert(*last);
+    }
+
+    for lane in [DualSameFileLane::Adb, DualSameFileLane::Wifi] {
+        if let Some(first) = completed_chunks
+            .iter()
+            .copied()
+            .find(|chunk_index| lane.owns_chunk(*chunk_index, wifi_stride))
+        {
+            guards.insert(first);
+        }
+        if let Some(last) = completed_chunks
+            .iter()
+            .copied()
+            .rev()
+            .find(|chunk_index| lane.owns_chunk(*chunk_index, wifi_stride))
+        {
+            guards.insert(last);
+        }
+    }
+
+    completed_chunks
+        .iter()
+        .copied()
+        .rev()
+        .take(2)
+        .for_each(|chunk_index| {
+            guards.insert(chunk_index);
+        });
+    guards.into_iter().collect()
+}
+
+fn verify_same_file_checkpoint_chunk(
+    host: &str,
+    local_path: &Path,
+    relative_path: &str,
+    offset: u64,
+    length: u64,
+) -> Result<bool, String> {
+    if length == 0 {
+        return Ok(true);
+    }
+    let remote = agent::pull_chunk_binary(host, relative_path, offset, length)
+        .map_err(|err| err.to_string())?;
+    if remote.payload.len() != length as usize {
+        return Ok(false);
+    }
+    let local_digest = blake3_digest_file_range(local_path, offset, length)?;
+    let remote_digest = blake3::hash(&remote.payload).to_hex().to_string();
+    Ok(local_digest == remote_digest)
+}
+
 fn chunk_count_for_size(size_bytes: u64, chunk_size: u64) -> u32 {
     if size_bytes == 0 {
         return 1;
@@ -4296,14 +4539,48 @@ fn blake3_digest_file(path: &Path) -> Result<String, String> {
     let mut hasher = blake3::Hasher::new();
     let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
     let mut buffer = [0u8; 64 * 1024];
+    let mut bytes_since_yield = 0usize;
     loop {
         let read = file.read(&mut buffer).map_err(|err| err.to_string())?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        bytes_since_yield += read;
+        if bytes_since_yield >= 8 * 1024 * 1024 {
+            bytes_since_yield = 0;
+            thread::yield_now();
+        }
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn blake3_digest_file_range(path: &Path, offset: u64, length: u64) -> Result<String, String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| err.to_string())?;
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        let read = file
+            .read(&mut buffer[..wanted])
+            .map_err(|err| err.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+        thread::yield_now();
+    }
+    if remaining == 0 {
+        Ok(hasher.finalize().to_hex().to_string())
+    } else {
+        Err(format!(
+            "short local read while hashing range: offset={offset} length={length}"
+        ))
+    }
 }
 
 fn ensure_verify_algorithm(payload: &str, expected_algorithm: &str) -> Result<(), String> {
@@ -4370,6 +4647,19 @@ fn validate_task_draft_inputs(
     }
 
     Ok(())
+}
+
+fn same_file_dual_task_chunk_size(
+    source_path: &Path,
+    requested_chunk_size: u64,
+) -> Result<Option<u64>, String> {
+    let manifest = collect_local_transfer_manifest(source_path)?;
+    Ok(manifest
+        .files
+        .into_iter()
+        .filter(|file| is_large_file(file.size_bytes, 32 * 1024 * 1024))
+        .map(|file| dual_same_file_chunk_size(file.size_bytes, requested_chunk_size))
+        .max())
 }
 
 #[tauri::command]
@@ -4604,6 +4894,17 @@ impl TaskFileRecord {
             .join(format!("{task_id}.json"));
         let payload = fs::read_to_string(path).map_err(|err| err.to_string())?;
         serde_json::from_str(&payload).map_err(|err| err.to_string())
+    }
+
+    fn delete(task_id: &str) -> Result<(), String> {
+        let path = nekotrans_state_root()
+            .join("tasks")
+            .join(format!("{task_id}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     fn list_ids() -> Result<Vec<String>, String> {
@@ -4946,6 +5247,7 @@ pub fn run() {
             cancel_transfer_task,
             retry_transfer_task,
             recover_task,
+            delete_transfer_task,
             install_agent,
             start_adb_docs_push,
             pause_adb_transfer,

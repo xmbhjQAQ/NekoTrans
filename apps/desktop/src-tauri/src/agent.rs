@@ -271,9 +271,10 @@ pub fn stat_file(host: &str, relative_path: &str) -> Result<AgentReply, AgentCli
 }
 
 pub fn verify_file(host: &str, relative_path: &str) -> Result<AgentReply, AgentClientError> {
-    send_command(
+    send_command_with_timeout(
         &AgentEndpoint::new(host, DEFAULT_AGENT_PORT),
         &format!("VERIFY_FILE {} BLAKE3", sanitize_path_arg(relative_path)),
+        Duration::from_millis(DEFAULT_TIMEOUT_MS.max(1_800_000)),
     )
 }
 
@@ -289,6 +290,14 @@ pub fn send_command(
     command: &str,
 ) -> Result<AgentReply, AgentClientError> {
     let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
+    send_command_with_timeout(endpoint, command, timeout)
+}
+
+fn send_command_with_timeout(
+    endpoint: &AgentEndpoint,
+    command: &str,
+    timeout: Duration,
+) -> Result<AgentReply, AgentClientError> {
     let mut stream = TcpStream::connect_timeout(&endpoint.socket_addr()?, timeout)
         .map_err(|err| AgentClientError::Io(err.to_string()))?;
     stream
