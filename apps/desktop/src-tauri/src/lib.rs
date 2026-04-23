@@ -502,10 +502,10 @@ fn start_transfer_task(
             start_wifi_pull_from_record(record, registry, engine)
         }
         (Direction::AndroidToPc, TransportMode::Dual) => {
-            if record.device_serial.is_some() {
-                start_adb_pull_from_record(record, registry, engine)
-            } else {
+            if record.agent_host.is_some() {
                 start_wifi_pull_from_record(record, registry, engine)
+            } else {
+                start_adb_pull_from_record(record, registry, engine)
             }
         }
     }
@@ -1017,14 +1017,20 @@ fn start_wifi_transfer_from_record(
     let manifest = collect_local_transfer_manifest(&local_path)?;
     let directories = manifest.directories;
     let files = manifest.files;
+    let requested_chunk_size = record.chunk_size_bytes.unwrap_or(8 * 1024 * 1024);
+    let worker_chunk_size = wifi_task_chunk_size_for_files(&files, requested_chunk_size);
+    if record.chunk_size_bytes != Some(worker_chunk_size) {
+        if let Ok(mut engine) = engine.0.lock() {
+            let _ = engine.reconfigure_task_chunk_size(&record.task_id, worker_chunk_size);
+        }
+        let mut updated = record.clone();
+        updated.chunk_size_bytes = Some(worker_chunk_size);
+        let _ = updated.persist();
+    }
     let worker_task_id = task_id.clone();
     let worker_host = host.clone();
     let worker_registry = registry_handle.clone();
     let worker_engine = engine_handle.clone();
-    let worker_chunk_size = record
-        .chunk_size_bytes
-        .unwrap_or(256 * 1024)
-        .clamp(1, 256 * 1024);
     thread::spawn(move || {
         let result = run_wifi_pc_to_android(
             &worker_host,
@@ -1090,10 +1096,17 @@ fn start_wifi_pull_from_record(
     let worker_host = host.clone();
     let worker_registry = registry_handle.clone();
     let worker_engine = engine_handle.clone();
-    let worker_chunk_size = record
-        .chunk_size_bytes
-        .unwrap_or(256 * 1024)
-        .clamp(1, 256 * 1024);
+    let requested_chunk_size = record.chunk_size_bytes.unwrap_or(8 * 1024 * 1024);
+    let worker_chunk_size =
+        wifi_transfer_chunk_size(record.source_size_bytes.unwrap_or(0), requested_chunk_size);
+    if record.chunk_size_bytes != Some(worker_chunk_size) {
+        if let Ok(mut engine) = engine.0.lock() {
+            let _ = engine.reconfigure_task_chunk_size(&record.task_id, worker_chunk_size);
+        }
+        let mut updated = record.clone();
+        updated.chunk_size_bytes = Some(worker_chunk_size);
+        let _ = updated.persist();
+    }
     thread::spawn(move || {
         let result = run_wifi_android_to_pc(
             &worker_host,
@@ -1275,17 +1288,8 @@ fn run_wifi_pc_to_android(
         }
 
         if verify_enabled {
-            let local_digest = blake3_digest_file(&file.local_path)?;
-            let verify = agent::verify_file(host, &relative_path).map_err(|err| err.to_string())?;
-            ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
-            let remote_digest = json_string_field(&verify.payload, "digest").ok_or_else(|| {
-                format!("agent verify did not include digest: {}", verify.payload)
-            })?;
-            if local_digest != remote_digest {
-                return Err(format!(
-                    "verify failed for {relative_path}: local={local_digest} remote={remote_digest}"
-                ));
-            }
+            verify_android_remote_file(host, &relative_path, &file.local_path, file.size_bytes)
+                .map_err(|message| format!("{message}"))?;
         }
     }
 
@@ -1606,16 +1610,7 @@ fn run_dual_wifi_single_file(
     );
 
     if verify_enabled {
-        let local_digest = blake3_digest_file(&file.local_path)?;
-        let verify = agent::verify_file(host, &relative_path).map_err(|err| err.to_string())?;
-        ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
-        let remote_digest = json_string_field(&verify.payload, "digest")
-            .ok_or_else(|| format!("agent verify did not include digest: {}", verify.payload))?;
-        if local_digest != remote_digest {
-            return Err(format!(
-                "verify failed for {relative_path}: local={local_digest} remote={remote_digest}"
-            ));
-        }
+        verify_android_remote_file(host, &relative_path, &file.local_path, file.size_bytes)?;
     }
 
     Ok(())
@@ -1799,19 +1794,12 @@ fn flush_small_file_bundle(
             false,
         );
         if verify_enabled {
-            let local_digest = blake3_digest_file(&entry.file.local_path)?;
-            let verify =
-                agent::verify_file(host, &entry.relative_path).map_err(|err| err.to_string())?;
-            ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
-            let remote_digest = json_string_field(&verify.payload, "digest").ok_or_else(|| {
-                format!("agent verify did not include digest: {}", verify.payload)
-            })?;
-            if local_digest != remote_digest {
-                return Err(format!(
-                    "verify failed for {}: local={} remote={}",
-                    entry.relative_path, local_digest, remote_digest
-                ));
-            }
+            verify_android_remote_file(
+                host,
+                &entry.relative_path,
+                &entry.file.local_path,
+                entry.size_bytes,
+            )?;
         }
     }
 
@@ -1965,18 +1953,6 @@ fn run_dual_same_file_pc_to_android_files(
             "正在让手机端合并临时文件",
         );
         agent::complete_file(host, &relative_path).map_err(|err| err.to_string())?;
-        let local_digest = if verify_enabled {
-            note_dual_stage(
-                &registry,
-                task_id,
-                &aggregate,
-                "dual-local-verify",
-                "正在 Windows 端计算源文件 BLAKE3",
-            );
-            Some(blake3_digest_file(&file.local_path)?)
-        } else {
-            None
-        };
         note_dual_stage(
             &registry,
             task_id,
@@ -1984,33 +1960,25 @@ fn run_dual_same_file_pc_to_android_files(
             "dual-remote-stat",
             "正在读取手机端文件大小",
         );
-        let stat = agent::stat_file(host, &relative_path).map_err(|err| err.to_string())?;
-        let remote_size = json_u64_field(&stat.payload, "size_bytes")
-            .ok_or_else(|| format!("agent stat did not include size_bytes: {}", stat.payload))?;
+        let remote_size = wait_for_remote_file_size(host, &relative_path, file.size_bytes)?;
         if remote_size != file.size_bytes {
             return Err(format!(
                 "same-file Dual size mismatch for {relative_path}: local={} remote={remote_size}",
                 file.size_bytes
             ));
         }
-        if let Some(local_digest) = local_digest {
+        if verify_enabled {
             note_dual_stage(
                 &registry,
                 task_id,
                 &aggregate,
                 "dual-remote-verify",
-                "正在手机端计算目标文件 BLAKE3",
+                "正在快速校验手机端目标文件",
             );
-            let verify = agent::verify_file(host, &relative_path).map_err(|err| err.to_string())?;
-            ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
-            let remote_digest = json_string_field(&verify.payload, "digest").ok_or_else(|| {
-                format!("agent verify did not include digest: {}", verify.payload)
-            })?;
-            if local_digest != remote_digest {
-                return Err(format!(
-                    "same-file Dual verify failed for {relative_path}: local={local_digest} remote={remote_digest}"
-                ));
-            }
+            verify_android_remote_file(host, &relative_path, &file.local_path, file.size_bytes)
+                .map_err(|message| {
+                    format!("same-file Dual verify failed for {relative_path}: {message}")
+                })?;
         }
         if let Ok(mut engine) = engine.lock() {
             let _ = engine.record_real_file_complete(
@@ -2799,11 +2767,16 @@ fn run_wifi_android_to_pc(
     engine: Arc<Mutex<TransferEngine>>,
 ) -> Result<String, String> {
     agent::start_task(host, task_id).map_err(|err| err.to_string())?;
+    let source = resolve_agent_pull_source(source_relative)?;
+    if let Some(root) = &source.agent_root {
+        agent::set_target_root(host, root).map_err(|err| err.to_string())?;
+    }
     let checkpoint = load_task_checkpoint(&engine, task_id);
-    let stat = agent::stat_file(host, source_relative).map_err(|err| err.to_string())?;
+    let stat =
+        agent::stat_file(host, &source.agent_relative_path).map_err(|err| err.to_string())?;
     let size_bytes = json_u64_field(&stat.payload, "size_bytes")
         .ok_or_else(|| format!("agent stat did not include size_bytes: {}", stat.payload))?;
-    let target_file = safe_local_join(target_root, source_relative)?;
+    let target_file = safe_local_join(target_root, &source.local_relative_path)?;
     if let Some(parent) = target_file.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -2841,7 +2814,8 @@ fn run_wifi_android_to_pc(
             skipped_chunks += 1;
             continue;
         }
-        let (bytes, pull_path) = pull_wifi_chunk_bytes(host, source_relative, offset, length)?;
+        let (bytes, pull_path) =
+            pull_wifi_chunk_bytes(host, &source.agent_relative_path, offset, length)?;
         output
             .seek(SeekFrom::Start(offset))
             .map_err(|err| err.to_string())?;
@@ -2886,16 +2860,7 @@ fn run_wifi_android_to_pc(
     }
 
     if verify_enabled {
-        let local_digest = blake3_digest_file(&target_file)?;
-        let verify = agent::verify_file(host, source_relative).map_err(|err| err.to_string())?;
-        ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
-        let remote_digest = json_string_field(&verify.payload, "digest")
-            .ok_or_else(|| format!("agent verify did not include digest: {}", verify.payload))?;
-        if local_digest != remote_digest {
-            return Err(format!(
-                "verify failed for {source_relative}: local={local_digest} remote={remote_digest}"
-            ));
-        }
+        verify_android_remote_file(host, &source.agent_relative_path, &target_file, size_bytes)?;
     }
 
     Ok(format!(
@@ -2956,6 +2921,58 @@ fn pull_wifi_chunk_bytes(
             Ok((bytes, "base64-fallback"))
         }
     }
+}
+
+struct AgentPullSource {
+    agent_root: Option<String>,
+    agent_relative_path: String,
+    local_relative_path: String,
+}
+
+fn resolve_agent_pull_source(source_path: &str) -> Result<AgentPullSource, String> {
+    let normalized = source_path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        let trimmed = normalized.trim_end_matches('/');
+        let (parent, file_name) = trimmed
+            .rsplit_once('/')
+            .ok_or_else(|| format!("remote path has no file name: {source_path}"))?;
+        let file_name = file_name.trim();
+        if file_name.is_empty() {
+            return Err(format!("remote path has no file name: {source_path}"));
+        }
+        let agent_root = if parent.is_empty() {
+            "/".to_string()
+        } else {
+            parent.to_string()
+        };
+        return Ok(AgentPullSource {
+            agent_root: Some(agent_root),
+            agent_relative_path: file_name.to_string(),
+            local_relative_path: file_name.to_string(),
+        });
+    }
+
+    let agent_relative_path = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .map(|segment| {
+            segment
+                .chars()
+                .filter(|character| !character.is_control() && *character != '\0')
+                .collect::<String>()
+        })
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if agent_relative_path.is_empty() {
+        return Err("source path did not contain a safe Android file name".to_string());
+    }
+
+    Ok(AgentPullSource {
+        agent_root: None,
+        local_relative_path: agent_relative_path.clone(),
+        agent_relative_path,
+    })
 }
 
 #[tauri::command]
@@ -4021,6 +4038,104 @@ fn verify_same_file_checkpoint_chunk(
     Ok(local_digest == remote_digest)
 }
 
+fn wait_for_remote_file_size(
+    host: &str,
+    relative_path: &str,
+    expected_size: u64,
+) -> Result<u64, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_size = None;
+    while Instant::now() <= deadline {
+        let stat = agent::stat_file(host, relative_path).map_err(|err| err.to_string())?;
+        let remote_size = json_u64_field(&stat.payload, "size_bytes")
+            .ok_or_else(|| format!("agent stat did not include size_bytes: {}", stat.payload))?;
+        if remote_size == expected_size {
+            return Ok(remote_size);
+        }
+        last_size = Some(remote_size);
+        thread::sleep(Duration::from_millis(250));
+    }
+    Ok(last_size.unwrap_or(0))
+}
+
+fn verify_android_remote_file(
+    host: &str,
+    relative_path: &str,
+    local_path: &Path,
+    expected_size: u64,
+) -> Result<(), String> {
+    let remote_size = wait_for_remote_file_size(host, relative_path, expected_size)?;
+    if remote_size != expected_size {
+        return Err(format!(
+            "size mismatch for {relative_path}: local={expected_size} remote={remote_size}"
+        ));
+    }
+
+    if should_sample_android_verify(expected_size) {
+        verify_android_remote_file_samples(host, relative_path, local_path, expected_size)
+    } else {
+        let local_digest = blake3_digest_file(local_path)?;
+        let verify = agent::verify_file(host, relative_path).map_err(|err| err.to_string())?;
+        ensure_verify_algorithm(&verify.payload, "BLAKE3")?;
+        let remote_digest = json_string_field(&verify.payload, "digest")
+            .ok_or_else(|| format!("agent verify did not include digest: {}", verify.payload))?;
+        if local_digest == remote_digest {
+            Ok(())
+        } else {
+            Err(format!(
+                "verify failed for {relative_path}: local={local_digest} remote={remote_digest}"
+            ))
+        }
+    }
+}
+
+fn should_sample_android_verify(size_bytes: u64) -> bool {
+    is_large_file(size_bytes, 128 * 1024 * 1024)
+}
+
+fn verify_android_remote_file_samples(
+    host: &str,
+    relative_path: &str,
+    local_path: &Path,
+    size_bytes: u64,
+) -> Result<(), String> {
+    for (offset, length) in android_verify_sample_ranges(size_bytes) {
+        let remote = agent::pull_chunk_binary(host, relative_path, offset, length)
+            .map_err(|err| err.to_string())?;
+        if remote.payload.len() != length as usize {
+            return Err(format!(
+                "sample verify short read for {relative_path}: offset={offset} expected={length} actual={}",
+                remote.payload.len()
+            ));
+        }
+        let local_digest = blake3_digest_file_range(local_path, offset, length)?;
+        let remote_digest = blake3::hash(&remote.payload).to_hex().to_string();
+        if local_digest != remote_digest {
+            return Err(format!(
+                "sample verify failed for {relative_path}: offset={offset} length={length}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn android_verify_sample_ranges(size_bytes: u64) -> Vec<(u64, u64)> {
+    let sample_len = size_bytes.min(256 * 1024);
+    if sample_len == 0 {
+        return vec![(0, 0)];
+    }
+
+    let mut offsets = BTreeSet::new();
+    offsets.insert(0);
+    offsets.insert(size_bytes.saturating_sub(sample_len));
+    offsets.insert(((size_bytes.saturating_sub(sample_len)) / 2).min(size_bytes - sample_len));
+
+    offsets
+        .into_iter()
+        .map(|offset| (offset, sample_len))
+        .collect()
+}
+
 fn chunk_count_for_size(size_bytes: u64, chunk_size: u64) -> u32 {
     if size_bytes == 0 {
         return 1;
@@ -4037,7 +4152,7 @@ fn chunk_length_for(size_bytes: u64, chunk_size: u64, chunk_index: u32) -> u64 {
 }
 
 fn dual_wifi_chunk_size(requested: u64) -> u64 {
-    requested.clamp(1, 256 * 1024)
+    wifi_transfer_chunk_size(4 * 1024 * 1024 * 1024, requested).min(4 * 1024 * 1024)
 }
 
 fn dual_same_file_chunk_size(file_size: u64, requested: u64) -> u64 {
@@ -4049,6 +4164,34 @@ fn dual_same_file_chunk_size(file_size: u64, requested: u64) -> u64 {
         8 * 1024 * 1024
     };
     requested.max(adaptive).clamp(1, 64 * 1024 * 1024)
+}
+
+fn wifi_task_chunk_size_for_files(files: &[LocalTransferFile], requested: u64) -> u64 {
+    files
+        .iter()
+        .map(|file| wifi_transfer_chunk_size(file.size_bytes, requested))
+        .max()
+        .unwrap_or_else(|| wifi_transfer_chunk_size(0, requested))
+}
+
+fn wifi_transfer_chunk_size(file_size: u64, requested: u64) -> u64 {
+    let requested = requested.clamp(64 * 1024, 8 * 1024 * 1024);
+    let adaptive = if file_size >= 4 * 1024 * 1024 * 1024 {
+        8 * 1024 * 1024
+    } else if file_size >= 1024 * 1024 * 1024 {
+        4 * 1024 * 1024
+    } else if file_size >= 128 * 1024 * 1024 {
+        2 * 1024 * 1024
+    } else if file_size >= 16 * 1024 * 1024 {
+        1024 * 1024
+    } else if file_size >= 1024 * 1024 {
+        512 * 1024
+    } else if file_size > 0 {
+        256 * 1024
+    } else {
+        1024 * 1024
+    };
+    requested.max(adaptive).clamp(64 * 1024, 8 * 1024 * 1024)
 }
 
 fn is_file_fully_checkpointed(size_bytes: u64, chunk_size: u64, completed_chunks: &[u32]) -> bool {
@@ -5547,6 +5690,43 @@ mod tests {
         assert_eq!(
             super::same_file_calibration_sample_bytes(1024 * 1024 * 1024, 256 * 1024 * 1024),
             64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn android_verify_samples_cover_edges_without_duplicates() {
+        let ranges = super::android_verify_sample_ranges(5 * 1024 * 1024 * 1024);
+        assert!(ranges.len() >= 3);
+        assert_eq!(ranges.first().copied(), Some((0, 256 * 1024)));
+        assert_eq!(
+            ranges.last().copied(),
+            Some((5 * 1024 * 1024 * 1024 - 256 * 1024, 256 * 1024))
+        );
+
+        let unique = ranges
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), ranges.len());
+    }
+
+    #[test]
+    fn wifi_transfer_chunk_size_scales_with_file_size() {
+        assert_eq!(
+            super::wifi_transfer_chunk_size(512 * 1024, 64 * 1024),
+            256 * 1024
+        );
+        assert_eq!(
+            super::wifi_transfer_chunk_size(32 * 1024 * 1024, 512 * 1024),
+            1024 * 1024
+        );
+        assert_eq!(
+            super::wifi_transfer_chunk_size(2 * 1024 * 1024 * 1024, 1024 * 1024),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            super::wifi_transfer_chunk_size(8 * 1024 * 1024 * 1024, 16 * 1024 * 1024),
+            8 * 1024 * 1024
         );
     }
 }

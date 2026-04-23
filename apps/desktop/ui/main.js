@@ -736,7 +736,13 @@ function displayWorkerStage(eventText, messageText, task) {
     paused: "链路中断，已停在可恢复边界。",
     failed: "任务失败，请查看错误信息。",
   };
+  if (eventText === "dual-completed") {
+    return task?.verify_enabled ? "传输和校验已完成。" : "传输已完成。";
+  }
   const stage = mapped[eventText] || messageText || eventText || "";
+  if (eventText === "dual-remote-verify") {
+    return "正在快速抽样校验手机端目标文件。";
+  }
   if (task?.state === "Running" && task.progress_percent >= 100 && !stage) {
     return "数据已写完，正在完成文件收尾或校验。";
   }

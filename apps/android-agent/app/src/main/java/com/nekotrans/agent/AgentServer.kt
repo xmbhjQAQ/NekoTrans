@@ -674,20 +674,35 @@ object AgentServer {
             return ERROR_JSON
         }
 
-        return synchronized(taskLock) {
-            val task = activeTask ?: return@synchronized ERROR_JSON
-            val target = readableFileFor(relativePath) ?: return@synchronized ERROR_JSON
-            if (!target.exists()) {
-                return@synchronized "{\"type\":\"Error\",\"message\":\"file not found\"}"
+        val taskId: String
+        val target: File
+        synchronized(taskLock) {
+            val task = activeTask ?: return ERROR_JSON
+            val readable = readableFileFor(relativePath) ?: return ERROR_JSON
+            if (!readable.exists()) {
+                return "{\"type\":\"Error\",\"message\":\"file not found\"}"
             }
-            val payload = readFileRange(target, offset, length)
-            val encoded = Base64.encodeToString(payload, Base64.NO_WRAP)
+            taskId = task.taskId
+            target = readable
             activeTask = task.copy(
-                bytesTransferred = task.bytesTransferred + payload.size.toLong(),
                 lastRelativePath = relativePath,
                 updatedAtEpochMs = nowEpochMs(),
             )
-            appendLog("transfer", activeTask?.taskId ?: "", "chunk read: $relativePath@$offset")
+        }
+
+        val payload = readFileRange(target, offset, length)
+        val encoded = Base64.encodeToString(payload, Base64.NO_WRAP)
+
+        return synchronized(taskLock) {
+            val task = activeTask
+            if (task != null) {
+                activeTask = task.copy(
+                    bytesTransferred = task.bytesTransferred + payload.size.toLong(),
+                    lastRelativePath = relativePath,
+                    updatedAtEpochMs = nowEpochMs(),
+                )
+            }
+            appendLog("transfer", taskId, "chunk read: $relativePath@$offset")
             "{\"type\":\"ChunkPayload\",\"relative_path\":\"${escapeJson(relativePath)}\",\"offset\":$offset,\"length\":${payload.size},\"payload\":\"$encoded\"}"
         }
     }
@@ -710,30 +725,47 @@ object AgentServer {
             return
         }
 
-        val result = synchronized(taskLock) {
-            val task = activeTask ?: return@synchronized null
-            val target = readableFileFor(relativePath) ?: return@synchronized null
-            if (!target.exists()) {
-                return@synchronized null
+        val taskId: String
+        val target: File
+        synchronized(taskLock) {
+            val task = activeTask ?: run {
+                writeUtf8Line(output, ERROR_JSON)
+                return
             }
-            val payload = readFileRange(target, offset, length)
+            val readable = readableFileFor(relativePath) ?: run {
+                writeUtf8Line(output, ERROR_JSON)
+                return
+            }
+            if (!readable.exists()) {
+                writeUtf8Line(output, "{\"type\":\"Error\",\"message\":\"file not found\"}")
+                return
+            }
+            taskId = task.taskId
+            target = readable
             activeTask = task.copy(
-                bytesTransferred = task.bytesTransferred + payload.size.toLong(),
                 lastRelativePath = relativePath,
                 updatedAtEpochMs = nowEpochMs(),
             )
-            appendLog("transfer", activeTask?.taskId ?: "", "binary chunk read: $relativePath@$offset")
-            val header = "{\"type\":\"ChunkPayloadBin\",\"relative_path\":\"${escapeJson(relativePath)}\",\"offset\":$offset,\"length\":${payload.size}}"
-            Pair(header, payload)
         }
 
-        if (result == null) {
-            writeUtf8Line(output, ERROR_JSON)
-            return
+        val payload = readFileRange(target, offset, length)
+        val header = "{\"type\":\"ChunkPayloadBin\",\"relative_path\":\"${escapeJson(relativePath)}\",\"offset\":$offset,\"length\":${payload.size}}"
+
+        synchronized(taskLock) {
+            val task = activeTask
+            if (task != null) {
+                activeTask = task.copy(
+                    bytesTransferred = task.bytesTransferred + payload.size.toLong(),
+                    lastRelativePath = relativePath,
+                    updatedAtEpochMs = nowEpochMs(),
+                )
+            }
+            appendLog("transfer", taskId, "binary chunk read: $relativePath@$offset")
         }
-        output.write(result.first.toByteArray(StandardCharsets.UTF_8))
+
+        output.write(header.toByteArray(StandardCharsets.UTF_8))
         output.write('\n'.code)
-        output.write(result.second)
+        output.write(payload)
         output.flush()
     }
 
